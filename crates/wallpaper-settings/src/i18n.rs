@@ -11,11 +11,11 @@ mod ru;
 type Catalog = HashMap<&'static str, &'static str>;
 
 fn detect_language() -> Option<String> {
-    ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"]
-        .iter()
-        .filter_map(|var| std::env::var(var).ok())
-        .find(|v| !v.is_empty() && v != "C" && v != "POSIX")
-        .map(|v| v.to_ascii_lowercase())
+    select_language(["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"].iter().filter_map(|var| std::env::var(var).ok()))
+}
+
+fn select_language(values: impl IntoIterator<Item = String>) -> Option<String> {
+    values.into_iter().find(|v| !v.is_empty()).map(|v| v.to_ascii_lowercase())
 }
 
 fn catalog() -> Option<&'static Catalog> {
@@ -52,6 +52,14 @@ mod tests {
     #[test]
     fn substitutes_placeholders() {
         assert_eq!(trf("Remove {name}?", &[("name", "x")]), "Remove x?");
+    }
+
+    #[test]
+    fn neutral_locale_overrides_lower_priority_languages() {
+        for locale in ["C", "POSIX"] {
+            assert_eq!(select_language([locale.to_string(), "ru_RU.UTF-8".into()]), Some(locale.to_ascii_lowercase()));
+        }
+        assert_eq!(select_language(["".into(), "ru_RU.UTF-8".into()]), Some("ru_ru.utf-8".into()));
     }
 
     #[test]

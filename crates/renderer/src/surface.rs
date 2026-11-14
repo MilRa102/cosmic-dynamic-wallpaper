@@ -228,6 +228,15 @@ struct HeadInfo {
     serial: Option<String>,
 }
 
+fn monitor_identity(connector: &str, output_make: &str, output_model: &str, description: Option<&str>, head: Option<&HeadInfo>) -> (String, String) {
+    let make = head.map(|h| h.make.as_str()).filter(|s| !s.is_empty()).unwrap_or(output_make);
+    let model = head.map(|h| h.model.as_str()).filter(|s| !s.is_empty()).unwrap_or(output_model);
+    let key = monitor_key(make, model, head.and_then(|h| h.serial.as_deref()), connector);
+    let label = format!("{make} {model}").trim().to_string();
+    let label = if label.is_empty() { description.unwrap_or(connector).to_string() } else { label };
+    (key, label)
+}
+
 /// The `wallpaperd` application state — one instance drives every managed output plus
 /// the shared GPU context and config.
 pub struct WallpaperDaemon {
@@ -419,14 +428,7 @@ impl WallpaperDaemon {
     /// `wlr-output-management` head when known.
     fn identify(&self, connector: &str, info: &OutputInfo) -> (String, String) {
         let head = self.heads.iter().map(|(_, head)| head).find(|head| head.name == connector);
-        let (make, model) = match head {
-            Some(head) => (head.make.clone(), head.model.clone()),
-            None => (info.make.clone(), info.model.clone()),
-        };
-        let key = monitor_key(&make, &model, head.and_then(|h| h.serial.as_deref()), connector);
-        let label = format!("{make} {model}").trim().to_string();
-        let label = if label.is_empty() { info.description.clone().unwrap_or_else(|| connector.to_string()) } else { label };
-        (key, label)
+        monitor_identity(connector, &info.make, &info.model, info.description.as_deref(), head)
     }
 
     /// Recompute every output's monitor identity (heads can arrive after the
@@ -464,12 +466,17 @@ impl WallpaperDaemon {
             }
         }
 
+        let mut reevaluated = false;
         for index in changed {
             if self.outputs[index].size.is_some() {
                 self.load_pack_for(index);
                 let id = self.outputs[index].id.clone();
                 let _ = self.evaluate_and_draw(&id);
+                reevaluated = true;
             }
+        }
+        if reevaluated {
+            self.reschedule_idle_timer();
         }
 
         let monitors = self.outputs.iter().map(|o| (o.monitor_key.clone(), o.id.as_str().to_string(), o.label.clone())).collect();
@@ -1032,6 +1039,17 @@ fn earliest_wake(candidates: [Option<Instant>; 3], fallback: Duration) -> Instan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_identity_falls_back_to_each_wl_output_field() {
+        let mut head = HeadInfo::default();
+        assert_eq!(monitor_identity("DP-1", "Dell", "P2419H", None, Some(&head)),
+            ("model-Dell-P2419H".into(), "Dell P2419H".into()));
+        head.make = "Other".into();
+        head.serial = Some("ABC123".into());
+        assert_eq!(monitor_identity("DP-1", "Dell", "P2419H", None, Some(&head)),
+            ("edid-Other-P2419H-ABC123".into(), "Other P2419H".into()));
+    }
 
     #[test]
     fn clamp_reconfigure_size_rejects_zero_on_either_axis() {

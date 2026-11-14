@@ -423,11 +423,10 @@ pub(crate) fn boundaries_cached(location: &Location, date: NaiveDate) -> Option<
 /// Pure and deterministic: the same inputs always give the same output. Each block is
 /// split evenly between its images by position, so reordering inside one block never
 /// moves another block's times. Empty and non-occurring blocks report the image they
-/// inherit. Returns `None` only if the solar model rejects the date (see
-/// [`PeriodBoundaries::compute`]).
+/// inherit. Returns `None` if the solar model rejects a date or no neighboring
+/// image occurrence can be found within the query engine's bounded search.
 pub fn resolve_schedule(layout: &PeriodLayout, location: &Location, date: NaiveDate) -> Option<ResolvedSchedule> {
     let bounds = PeriodBoundaries::compute(location, date)?;
-    let next_bounds = PeriodBoundaries::compute(location, date.succ_opt()?)?;
 
     let mut blocks: Vec<ResolvedBlock> = SolarPeriod::ALL
         .into_iter()
@@ -449,16 +448,34 @@ pub fn resolve_schedule(layout: &PeriodLayout, location: &Location, date: NaiveD
         })
         .collect();
 
-    // First image start of the following solar day — where today's last image ends.
-    let next_day_first = SolarPeriod::ALL.into_iter().find_map(|period| {
-        let n = u8::try_from(layout.block(period).len()).unwrap_or(u8::MAX);
-        if n == 0 {
-            return None;
+    let neighboring_image = |forward: bool| {
+        let mut day = date;
+        // `query` searches up to 512 days in its radius-doubling search.
+        for _ in 0..512 {
+            day = if forward { day.succ_opt()? } else { day.pred_opt()? };
+            let other = PeriodBoundaries::compute(location, day)?;
+            for index in 0..SolarPeriod::COUNT {
+                let period = SolarPeriod::ALL[if forward { index } else { SolarPeriod::COUNT - 1 - index }];
+                let ids = layout.block(period);
+                let n = u8::try_from(ids.len()).unwrap_or(u8::MAX);
+                if n == 0 {
+                    continue;
+                }
+                let slot = if forward { 0 } else { n - 1 };
+                if let Some(start) = other.slot_instant(period, slot, n) {
+                    return Some((ids[usize::from(slot)].clone(), start));
+                }
+            }
         }
-        next_bounds.slot_instant(period, 0, n)
-    });
+        None
+    };
 
-    let mut following_start = next_day_first;
+    let (previous, next) = if layout.is_empty() {
+        (None, None)
+    } else {
+        (Some(neighboring_image(false)?), Some(neighboring_image(true)?))
+    };
+    let mut following_start = next.map(|(_, start)| start);
     for block in blocks.iter_mut().rev() {
         for image in block.images.iter_mut().rev() {
             if let Some(next) = following_start {
@@ -468,10 +485,7 @@ pub fn resolve_schedule(layout: &PeriodLayout, location: &Location, date: NaiveD
         }
     }
 
-    // Inheritance: walk forward, wrapping once so the first blocks of the day inherit
-    // the last image of the previous night.
-    let last_image = blocks.iter().rev().find_map(|b| b.images.last()).map(|i| i.id.clone());
-    let mut carried = last_image;
+    let mut carried = previous.map(|(id, _)| id);
     for block in &mut blocks {
         if let Some(last) = block.images.last() {
             carried = Some(last.id.clone());
@@ -708,6 +722,80 @@ mod tests {
         assert!(day.is_degenerate() && day.images.is_empty());
         let m3 = s.block(SolarPeriod::Morning).images.last().unwrap();
         assert_eq!(m3.active_until, s.block(SolarPeriod::Evening).start);
+    }
+
+    #[test]
+    fn polar_gaps_use_actual_images_on_neighboring_dates() {
+        let location = loc(78.2, 15.6);
+        let mut layout = PeriodLayout::new();
+        *layout.block_mut(SolarPeriod::Day) = ids(&["day"]);
+        *layout.block_mut(SolarPeriod::Night) = ids(&["night"]);
+        let pack = crate::WallpaperPack::validate(layout.to_images()).unwrap();
+
+        for d in [date(2024, 6, 21), date(2024, 12, 21)] {
+            let schedule = resolve_schedule(&layout, &location, d).unwrap();
+            for block in &schedule.blocks {
+                if block.images.is_empty() && !block.is_degenerate() {
+                    let at = block.start + (block.end - block.start) / 2;
+                    let result = pack.query(Some(&location), at, TimeDelta::zero());
+                    assert_eq!(block.inherited.as_ref(), Some(&result.active_before), "{d} {:?}", block.period);
+                }
+                for image in &block.images {
+                    let at = image.start + (image.end - image.start) / 2;
+                    let result = pack.query(Some(&location), at, TimeDelta::zero());
+                    assert_eq!(Some(image.active_until), result.next_transition_at, "{d} {:?}", block.period);
+                }
+            }
+
+        }
+    }
+
+    #[test]
+    fn last_night_image_holds_until_night_returns_after_polar_day() {
+        let location = loc(78.2, 15.6);
+        let mut layout = PeriodLayout::new();
+        *layout.block_mut(SolarPeriod::Night) = ids(&["night-1", "night-2"]);
+        let pack = crate::WallpaperPack::validate(layout.to_images()).unwrap();
+        let mut d = date(2024, 3, 1);
+        while d < date(2024, 7, 1) {
+            let today = PeriodBoundaries::compute(&location, d).unwrap();
+            let tomorrow = PeriodBoundaries::compute(&location, d.succ_opt().unwrap()).unwrap();
+            if !today.is_empty(SolarPeriod::Night) && tomorrow.is_empty(SolarPeriod::Night) {
+                let schedule = resolve_schedule(&layout, &location, d).unwrap();
+                let image = schedule.block(SolarPeriod::Night).images.last().unwrap();
+                let query = pack.query(Some(&location), image.start + (image.end - image.start) / 2, TimeDelta::zero());
+                assert_eq!(Some(image.active_until), query.next_transition_at);
+                assert!(image.active_until > image.end + TimeDelta::days(30));
+                return;
+            }
+            d = d.succ_opt().unwrap();
+        }
+        panic!("no polar-night gap found");
+    }
+
+    #[test]
+    fn first_block_inherits_yesterdays_night_when_todays_night_disappears() {
+        let location = loc(78.2, 15.6);
+        let mut layout = PeriodLayout::new();
+        *layout.block_mut(SolarPeriod::Day) = ids(&["day"]);
+        *layout.block_mut(SolarPeriod::Night) = ids(&["night"]);
+        let pack = crate::WallpaperPack::validate(layout.to_images()).unwrap();
+        let mut d = date(2024, 3, 1);
+        while d < date(2024, 7, 1) {
+            let today = PeriodBoundaries::compute(&location, d).unwrap();
+            let yesterday = PeriodBoundaries::compute(&location, d.pred_opt().unwrap()).unwrap();
+            if today.is_empty(SolarPeriod::Night) && !yesterday.is_empty(SolarPeriod::Night) {
+                let schedule = resolve_schedule(&layout, &location, d).unwrap();
+                let morning = schedule.block(SolarPeriod::Morning);
+                let at = morning.start + (morning.end - morning.start) / 2;
+                let query = pack.query(Some(&location), at, TimeDelta::zero());
+                assert_eq!(morning.inherited.as_ref().map(ImageId::as_str), Some("night"));
+                assert_eq!(morning.inherited.as_ref(), Some(&query.active_before));
+                return;
+            }
+            d = d.succ_opt().unwrap();
+        }
+        panic!("no polar-day transition found");
     }
 
     #[test]

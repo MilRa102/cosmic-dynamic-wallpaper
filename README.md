@@ -380,7 +380,8 @@ monitor reports no usable serial. Only a display with no EDID data at all — or
 identical serial-less monitors connected at once — falls back to its output name
 (`DP-1`). An unplugged monitor keeps its setting — the settings app lists it
 under "Disconnected monitors" until you choose "Forget". Monitors seen for the first
-time show the default pack.
+time show the default pack unless a pack was assigned in advance with
+`cosmic-wallpaperctl assign --output <monitor-key> <pack>`.
 
 ---
 

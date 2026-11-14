@@ -75,6 +75,10 @@ fn assign_output(state: &mut RendererConfig, id: &str, source: &pack_loader::Pac
         monitor.pack = Some(source.clone());
         return;
     }
+    if ["edid-", "model-", "output-"].iter().any(|prefix| id.starts_with(prefix)) {
+        state.monitors.insert(id.to_string(), wallpaper_ipc::MonitorConfig { pack: Some(source.clone()), ..Default::default() });
+        return;
+    }
     state.overrides.insert(id.to_string(), source.clone());
     for (key, monitor) in &mut state.monitors {
         let on_connector = match connected {
@@ -206,5 +210,20 @@ mod tests {
         assign_output(&mut state, "edid-x", &b, None);
         assert_eq!(state.monitors["edid-x"].pack, Some(b));
         assert!(!state.overrides.contains_key("edid-x"));
+    }
+
+    #[test]
+    fn unknown_monitor_key_is_registered_for_future_connection() {
+        let mut state = RendererConfig::default();
+        let source = pack_loader::PackSource::StaticFile("/a.jpg".into());
+        assign_output(&mut state, "edid-Dell-U2720Q-ABC123", &source, None);
+        assert_eq!(state.monitors["edid-Dell-U2720Q-ABC123"].pack, Some(source.clone()));
+        assert!(!state.overrides.contains_key("edid-Dell-U2720Q-ABC123"));
+        state.register_monitors(&[wallpaper_ipc::ConnectedMonitor {
+            key: "edid-Dell-U2720Q-ABC123".into(),
+            connector: "DP-3".into(),
+            label: "Dell U2720Q".into(),
+        }]);
+        assert_eq!(state.monitors["edid-Dell-U2720Q-ABC123"].pack, Some(source));
     }
 }
