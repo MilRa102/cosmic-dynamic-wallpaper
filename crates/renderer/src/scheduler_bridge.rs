@@ -17,7 +17,7 @@
 use chrono::{DateTime, Local, TimeDelta};
 
 use pack_loader::LoadedPack;
-use schedule_engine::{AnchorKind, Location, ScheduleQueryResult};
+use schedule_engine::{Location, ScheduleQueryResult};
 
 use crate::error::RendererError;
 use crate::output::OutputId;
@@ -41,7 +41,7 @@ pub fn evaluate(
         return Ok(None);
     };
 
-    if pack.pack.anchor_kind() == AnchorKind::Solar && location.is_none() {
+    if pack.pack.anchor_kind().needs_location() && location.is_none() {
         return Err(RendererError::LocationRequired { output: output.clone() });
     }
 
@@ -66,7 +66,7 @@ pub fn evaluate(
 /// output starts contributing as soon as one is.
 pub fn next_wake_for(pack: Option<&LoadedPack>, location: Option<&Location>, at: DateTime<Local>) -> Option<DateTime<Local>> {
     let pack = pack?;
-    if pack.pack.anchor_kind() == AnchorKind::Solar && location.is_none() {
+    if pack.pack.anchor_kind().needs_location() && location.is_none() {
         return None;
     }
     pack.pack.next_transition_after(location, at)

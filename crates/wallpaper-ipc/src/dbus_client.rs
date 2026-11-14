@@ -123,6 +123,13 @@ impl DbusClient {
         self.proxy.call("Reevaluate", &(output_id,)).map_err(|e| map_error(&e, output_id))
     }
 
+    /// `ListMonitors() -> [(monitor_key, connector, label)]` — the monitors the daemon
+    /// currently drives, with their stable identity.
+    pub fn list_monitors(&self) -> Result<Vec<crate::ConnectedMonitor>, DbusError> {
+        let entries: Vec<(String, String, String)> = self.proxy.call("ListMonitors", &()).map_err(|e| map_error(&e, ""))?;
+        Ok(entries.into_iter().map(|(key, connector, label)| crate::ConnectedMonitor { key, connector, label }).collect())
+    }
+
     /// `ReevaluateAll() -> ()` (FR-010 with no `--output`).
     pub fn reevaluate_all(&self) -> Result<(), DbusError> {
         self.proxy.call("ReevaluateAll", &()).map_err(|e| map_error(&e, ""))

@@ -10,6 +10,7 @@ use cosmic::{executor, Core, Element};
 use schedule_engine::Location;
 use wallpaper_ipc::{effective_location, LocationConfigEntry, RendererConfig};
 
+use crate::i18n::{tr, trf};
 use crate::pages;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,26 @@ fn open_renderer_config_or_exit() -> cosmic_config::Config {
     })
 }
 
+/// The monitors the daemon drives right now (`None` when it isn't reachable), and
+/// whether it's an older daemon without `ListMonitors` — its connectors are then
+/// listed as connector-keyed monitors.
+fn connected_monitors() -> (Option<Vec<wallpaper_ipc::ConnectedMonitor>>, bool) {
+    let Ok(client) = wallpaper_ipc::DbusClient::connect() else { return (None, false) };
+    if let Ok(monitors) = client.list_monitors() {
+        return (Some(monitors), false);
+    }
+    let Ok(entries) = client.query_all() else { return (None, false) };
+    let monitors = entries
+            .into_iter()
+            .map(|e| wallpaper_ipc::ConnectedMonitor {
+                key: wallpaper_ipc::monitor_key("", "", None, &e.output),
+                label: e.output.clone(),
+                connector: e.output,
+            })
+            .collect();
+    (Some(monitors), true)
+}
+
 fn open_location_config_or_exit() -> cosmic_config::Config {
     LocationConfigEntry::open().unwrap_or_else(|e| {
         eprintln!("error: failed to open the location config: {e}");
@@ -77,12 +98,23 @@ fn open_location_config_or_exit() -> cosmic_config::Config {
 impl App {
     fn refresh_assignment(&mut self) {
         let renderer_config = RendererConfig::migrate_from_old_app_id(&self.renderer_config_store);
-        let known_outputs = wallpaper_ipc::DbusClient::connect().and_then(|c| c.query_all()).map(|entries| entries.into_iter().map(|e| e.output).collect()).unwrap_or_default();
+        let (connected, legacy_daemon) = connected_monitors();
         let known_packs = self.pack_registry.known_packs();
         let available_packs = known_packs.iter().map(|e| e.source.clone()).collect();
         let available_pack_display_names = known_packs.iter().map(|e| e.display_name.clone()).collect();
         self.assignment =
-            pages::assignment::State { known_outputs, available_packs, available_pack_display_names, current_config: renderer_config };
+            pages::assignment::State { connected, legacy_daemon, available_packs, available_pack_display_names, current_config: renderer_config };
+    }
+
+    /// Applies a Monitors-page edit to a fresh read of the config, so a monitor the
+    /// daemon registered since the page was loaded isn't clobbered by the save.
+    fn update_monitor_config(&mut self, edit: impl FnOnce(&mut RendererConfig)) {
+        let mut config = RendererConfig::load(&self.renderer_config_store);
+        edit(&mut config);
+        if let Err(e) = config.save(&self.renderer_config_store) {
+            tracing::error!(error = %e, "failed to save monitor assignment");
+        }
+        self.assignment.current_config = config;
     }
 
     /// The current/next thumbnails on the Timeline page (`pack_display::
@@ -131,11 +163,11 @@ impl cosmic::Application for App {
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
         let mut nav_model = nav_bar::Model::default();
-        nav_model.insert().text("Packs").data(Page::Packs);
-        nav_model.insert().text("Assignment").data(Page::Assignment);
-        nav_model.insert().text("Location").data(Page::Location);
-        nav_model.insert().text("Timeline").data(Page::Timeline);
-        nav_model.insert().text("Crossfade").data(Page::Crossfade);
+        nav_model.insert().text(tr("Packs")).data(Page::Packs);
+        nav_model.insert().text(tr("Monitors")).data(Page::Assignment);
+        nav_model.insert().text(tr("Location")).data(Page::Location);
+        nav_model.insert().text(tr("Timeline")).data(Page::Timeline);
+        nav_model.insert().text(tr("Crossfade")).data(Page::Crossfade);
         nav_model.activate_position(0);
 
         let mut pack_registry = open_registry_or_exit();
@@ -144,12 +176,13 @@ impl cosmic::Application for App {
 
         let packs = pages::packs::State::load(&mut pack_registry);
         let renderer_config = RendererConfig::migrate_from_old_app_id(&renderer_config_store);
-        let known_outputs = wallpaper_ipc::DbusClient::connect().and_then(|c| c.query_all()).map(|entries| entries.into_iter().map(|e| e.output).collect()).unwrap_or_default();
+        let (connected, legacy_daemon) = connected_monitors();
         let known_packs = pack_registry.known_packs();
         let available_packs = known_packs.iter().map(|e| e.source.clone()).collect();
         let available_pack_display_names = known_packs.iter().map(|e| e.display_name.clone()).collect();
         let assignment = pages::assignment::State {
-            known_outputs,
+            connected,
+            legacy_daemon,
             available_packs,
             available_pack_display_names,
             current_config: renderer_config.clone(),
@@ -185,6 +218,21 @@ impl cosmic::Application for App {
         Task::none()
     }
 
+    /// While an image is being dragged in the pack builder, a left-button release
+    /// anywhere ends the drag — the page's own `mouse_area` only sees releases over
+    /// its scrollable, and a drag left alive would make a later plain click drop it.
+    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
+        if !self.pack_builder.as_ref().is_some_and(|state| state.dragging.is_some()) {
+            return cosmic::iced::Subscription::none();
+        }
+        cosmic::iced::event::listen_with(|event, _, _| match event {
+            cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(cosmic::iced::mouse::Button::Left)) => {
+                Some(Message::PackBuilder(pages::pack_builder::Message::DragReleased))
+            }
+            _ => None,
+        })
+    }
+
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Packs(pages::packs::Message::Refresh) => {
@@ -198,11 +246,11 @@ impl cosmic::Application for App {
                 }
                 return cosmic::task::future(async move {
                     use cosmic::dialog::file_chooser;
-                    match file_chooser::open::Dialog::new().title("Choose a pack folder").open_folder().await {
+                    match file_chooser::open::Dialog::new().title(tr("Choose a pack folder")).open_folder().await {
                         Ok(response) => match response.url().to_file_path() {
                             Ok(path) => Message::Packs(pages::packs::Message::AddResult(Ok(path))),
                             Err(()) => Message::Packs(pages::packs::Message::AddResult(Err(
-                                "the selected folder has no local file path".to_string(),
+                                tr("the selected folder has no local file path"),
                             ))),
                         },
                         Err(file_chooser::Error::Cancelled) => Message::Packs(pages::packs::Message::AddCancelled),
@@ -218,11 +266,11 @@ impl cosmic::Application for App {
                 }
                 return cosmic::task::future(async move {
                     use cosmic::dialog::file_chooser;
-                    match file_chooser::open::Dialog::new().title("Choose an image file").open_file().await {
+                    match file_chooser::open::Dialog::new().title(tr("Choose an image file")).open_file().await {
                         Ok(response) => match response.url().to_file_path() {
                             Ok(path) => Message::Packs(pages::packs::Message::AddResult(Ok(path))),
                             Err(()) => Message::Packs(pages::packs::Message::AddResult(Err(
-                                "the selected file has no local file path".to_string(),
+                                tr("the selected file has no local file path"),
                             ))),
                         },
                         Err(file_chooser::Error::Cancelled) => Message::Packs(pages::packs::Message::AddCancelled),
@@ -247,7 +295,9 @@ impl cosmic::Application for App {
                 // load/registration error) is unchanged.
                 match result {
                     Ok(path) if pages::pack_builder::should_open_for(&path) => {
-                        self.pack_builder = Some(pages::pack_builder::open(path));
+                        let mut state = pages::pack_builder::open(path);
+                        state.location = self.current_location();
+                        self.pack_builder = Some(state);
                     }
                     other => {
                         pages::packs::apply_add_result(&mut self.packs, &mut self.pack_registry, other);
@@ -272,8 +322,9 @@ impl cosmic::Application for App {
             // anything (FR-019).
             Message::Packs(pages::packs::Message::EditRequested(source)) => {
                 match pages::pack_builder::open_for_edit(source.path().to_path_buf(), source.clone()) {
-                    Ok(state) => {
+                    Ok(mut state) => {
                         self.packs.edit_error = None;
+                        state.location = self.current_location();
                         self.pack_builder = Some(state);
                     }
                     Err(reason) => {
@@ -299,28 +350,22 @@ impl cosmic::Application for App {
             Message::Packs(pages::packs::Message::RenameCancelled) => {
                 pages::packs::cancel_rename(&mut self.packs);
             }
-            Message::Assignment(pages::assignment::Message::ToggleSameEverywhere(toggled_on)) => {
-                let default_pack = self.assignment.available_packs.first().cloned();
-                pages::assignment::set_same_everywhere_enabled(&mut self.assignment.current_config, toggled_on, default_pack);
-                if let Err(e) = self.assignment.current_config.save(&self.renderer_config_store) {
-                    tracing::error!(error = %e, "failed to save same-pack-everywhere toggle");
+            Message::Assignment(pages::assignment::Message::DefaultPackSelected(index)) => {
+                let source = self.assignment.pack_at(index);
+                self.update_monitor_config(|config| pages::assignment::set_default_pack(config, source));
+            }
+            Message::Assignment(pages::assignment::Message::MonitorPackSelected(key, index)) => {
+                let source = self.assignment.pack_at(index);
+                let monitor = self.assignment.connected_monitor(&key).cloned();
+                match monitor {
+                    Some(monitor) if self.assignment.legacy_daemon => {
+                        self.update_monitor_config(|config| pages::assignment::set_legacy_override(config, &monitor.connector, source));
+                    }
+                    _ => self.update_monitor_config(|config| pages::assignment::set_monitor_pack(config, &key, monitor.as_ref(), source)),
                 }
             }
-            Message::Assignment(pages::assignment::Message::SameEverywherePackSelected(index)) => {
-                if let Some(source) = self.assignment.available_packs.get(index).cloned() {
-                    pages::assignment::apply_assignment(&mut self.assignment.current_config, &pages::assignment::AssignTarget::SameEverywhere, source);
-                    if let Err(e) = self.assignment.current_config.save(&self.renderer_config_store) {
-                        tracing::error!(error = %e, "failed to save same-pack-everywhere assignment");
-                    }
-                }
-            }
-            Message::Assignment(pages::assignment::Message::OutputPackSelected(output, index)) => {
-                if let Some(source) = self.assignment.available_packs.get(index).cloned() {
-                    pages::assignment::apply_assignment(&mut self.assignment.current_config, &pages::assignment::AssignTarget::Output(output), source);
-                    if let Err(e) = self.assignment.current_config.save(&self.renderer_config_store) {
-                        tracing::error!(error = %e, "failed to save output assignment");
-                    }
-                }
+            Message::Assignment(pages::assignment::Message::ForgetMonitor(key)) => {
+                self.update_monitor_config(|config| pages::assignment::forget_monitor(config, &key));
             }
             Message::Location(pages::location::Message::SelectMode(mode)) => {
                 pages::location::set_mode(&mut self.location.entry, mode);
@@ -363,6 +408,53 @@ impl cosmic::Application for App {
             Message::PackBuilder(pages::pack_builder::Message::ModeChosen(mode)) => {
                 if let Some(state) = self.pack_builder.as_mut() {
                     pages::pack_builder::set_mode(state, mode);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::DragStarted(name)) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::start_drag(state, name);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::DragEntered(target)) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::drag_entered(state, target);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::DragLeft(target)) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::drag_left(state, target);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::DragScrolled) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::drag_scrolled(state);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::DragReleased) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::release_drag(state);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::BlockSelected(name, block)) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::select_block(state, &name, block);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::MoveWithinBlock(name, delta)) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::move_within_block(state, &name, delta);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::PreviewDayShifted(days)) => {
+                if let Some(state) = self.pack_builder.as_mut() {
+                    pages::pack_builder::shift_preview_day(state, days);
+                }
+            }
+            Message::PackBuilder(pages::pack_builder::Message::ConvertToBlocks) => {
+                let location = self.current_location();
+                if let Some(state) = self.pack_builder.as_mut() {
+                    state.location = location;
+                    pages::pack_builder::convert_to_blocks(state);
                 }
             }
             Message::PackBuilder(pages::pack_builder::Message::Cancelled) => {
@@ -506,17 +598,17 @@ impl cosmic::Application for App {
             .iter()
             .find(|row| &row.source == source)
             .map(|row| row.name.clone())
-            .unwrap_or_else(|| "(unnamed pack)".to_string());
+            .unwrap_or_else(|| tr("(unnamed pack)"));
         Some(
             widget::dialog()
-                .title("Remove pack?")
-                .body(format!("Remove {name}? This cannot be undone."))
+                .title(tr("Remove pack?"))
+                .body(trf("Remove {name}? This cannot be undone.", &[("name", &name)]))
                 .primary_action(
-                    widget::button::destructive("Remove")
+                    widget::button::destructive(tr("Remove"))
                         .on_press(Message::Packs(pages::packs::Message::RemoveConfirmed)),
                 )
                 .secondary_action(
-                    widget::button::standard("Cancel")
+                    widget::button::standard(tr("Cancel"))
                         .on_press(Message::Packs(pages::packs::Message::RemoveCancelled)),
                 )
                 .into(),

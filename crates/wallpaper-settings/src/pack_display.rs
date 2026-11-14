@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, TimeDelta};
 use pack_loader::PackSource;
-use schedule_engine::{AnchorKind, Location, SolarEventKind, TimeAnchor};
+use schedule_engine::{Location, SolarEventKind, SolarPeriod, TimeAnchor};
 
 /// The human-readable label for a registered pack (spec.md FR-010, Key Entities "Pack
 /// name"): a directory pack's manifest `name`; a static-file pack's filename with the
@@ -85,7 +85,7 @@ pub fn resolve_schedule_snapshot(
     at: DateTime<Local>,
 ) -> Option<ScheduleSnapshot> {
     let loaded = pack_loader::load_pack(source.path()).ok()?;
-    if loaded.pack.anchor_kind() == AnchorKind::Solar && location.is_none() {
+    if loaded.pack.anchor_kind().needs_location() && location.is_none() {
         return None;
     }
     let result = loaded.pack.query(location, at, crossfade_duration);
@@ -112,7 +112,13 @@ pub fn resolve_thumbnail_path(source: &PackSource) -> Option<PathBuf> {
         .pack
         .images()
         .iter()
-        .find(|img| matches!(img.anchor, TimeAnchor::Solar { event: SolarEventKind::SolarNoon, .. }))
+        .find(|img| {
+            matches!(
+                img.anchor,
+                TimeAnchor::Solar { event: SolarEventKind::SolarNoon, .. }
+                    | TimeAnchor::Period { period: SolarPeriod::Day, slot: 0, .. }
+            )
+        })
         .or_else(|| loaded.pack.images().first())?;
     loaded.image_paths.get(&chosen.id).cloned()
 }

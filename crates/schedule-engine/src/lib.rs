@@ -29,6 +29,7 @@ mod anchor;
 mod error;
 mod location;
 mod pack;
+mod periods;
 mod query;
 mod solar;
 
@@ -36,7 +37,11 @@ pub use anchor::{SolarEventKind, TimeAnchor};
 pub use error::{CoordinateField, LocationError, PackError};
 pub use location::Location;
 pub use pack::{AnchorKind, ImageId, PackImage, ValidatedPack, WallpaperPack, MAX_ANCHORS};
-pub use query::{ScheduleQueryResult, TransitionState};
+pub use periods::{
+    period_at, resolve_schedule, PeriodBoundaries, PeriodLayout, ResolvedBlock, ResolvedImage,
+    ResolvedSchedule, SolarPeriod, MIN_PERIOD_LENGTH,
+};
+pub use query::{anchor_instant, ScheduleQueryResult, TransitionState};
 
 /// Test-only internal accessors. **Not** part of the committed public contract
 /// (contracts/schedule-engine-api.md) — exists solely so `tests/solar_accuracy.rs` can

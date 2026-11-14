@@ -84,6 +84,11 @@ pub enum PackError {
         /// The offending offset.
         offset: chrono::TimeDelta,
     },
+    /// A solar block's slot numbers weren't exactly `0..n` with `of == n` for every image.
+    InvalidPeriodSlots {
+        /// The offending block.
+        period: crate::periods::SolarPeriod,
+    },
 }
 
 impl fmt::Display for PackError {
@@ -94,7 +99,7 @@ impl fmt::Display for PackError {
                 write!(f, "pack contains {count} anchors, which exceeds the limit of 64")
             }
             PackError::MixedAnchorTypes => {
-                write!(f, "pack mixes solar-anchored and clock-anchored images")
+                write!(f, "pack mixes different anchor types")
             }
             PackError::DuplicateInstant => {
                 write!(f, "two or more anchors resolve to the exact same instant")
@@ -107,6 +112,9 @@ impl fmt::Display for PackError {
                 // stay within chrono's own, already-overflow-safe `Debug` impl rather
                 // than this crate re-deriving a magnitude by hand.
                 write!(f, "solar offset {offset:?} on {event:?} exceeds the {}-hour limit", crate::pack::MAX_SOLAR_OFFSET_HOURS)
+            }
+            PackError::InvalidPeriodSlots { period } => {
+                write!(f, "images in the {period} block have inconsistent slot numbers")
             }
         }
     }
@@ -145,7 +153,7 @@ mod tests {
         );
         assert_eq!(
             PackError::MixedAnchorTypes.to_string(),
-            "pack mixes solar-anchored and clock-anchored images"
+            "pack mixes different anchor types"
         );
         assert_eq!(
             PackError::DuplicateInstant.to_string(),

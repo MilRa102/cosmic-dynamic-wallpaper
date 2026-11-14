@@ -40,8 +40,8 @@ image = { version = "0.25", default-features = false, features = [
 # (`dirs::data_dir()`). Already resolved in Cargo.lock at v6.0.0 as a transitive
 # dependency of `cosmic-config` — this adds zero new crates to the build.
 dirs = "6.0"
-
-[dev-dependencies]
+# Atomically publish cached thumbnails so another settings instance cannot read a
+# partially written PNG.
 tempfile = "3.27"
 
 [lints.clippy]

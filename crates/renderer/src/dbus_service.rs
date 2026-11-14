@@ -63,6 +63,8 @@ pub struct DbusState {
     snapshot: HashMap<OutputId, QueryResponse>,
     known_outputs: Vec<OutputId>,
     pending: VecDeque<ReevaluateRequest>,
+    /// `(monitor_key, connector, label)` for every connected monitor — `ListMonitors`.
+    monitors: Vec<(String, String, String)>,
 }
 
 impl DbusState {
@@ -71,6 +73,11 @@ impl DbusState {
     pub fn refresh(&mut self, responses: Vec<QueryResponse>, known: Vec<OutputId>) {
         self.snapshot = responses.into_iter().map(|r| (r.output.clone(), r)).collect();
         self.known_outputs = known;
+    }
+
+    /// Replace the connected-monitor list `ListMonitors` answers with.
+    pub fn set_monitors(&mut self, monitors: Vec<(String, String, String)>) {
+        self.monitors = monitors;
     }
 
     /// Drain every pending `Reevaluate`/`ReevaluateAll` request, in the order received
@@ -149,6 +156,14 @@ impl DaemonInterface {
             response.active_image.clone(),
             response.next_transition_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
         ))
+    }
+
+    /// `ListMonitors() -> Array<(monitor_key, connector, label)>` — the connected
+    /// monitors with their stable, port-independent identity (the settings GUI's
+    /// Monitors page; everything else in the config is "disabled").
+    fn list_monitors(&self) -> Vec<(String, String, String)> {
+        self.assert_main_thread();
+        lock(&self.state).monitors.clone()
     }
 
     /// `QueryAll() -> Array<(output_id, assigned, active_image, next_transition_at)>`

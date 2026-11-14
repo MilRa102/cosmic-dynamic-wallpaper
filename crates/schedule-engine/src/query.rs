@@ -285,6 +285,13 @@ impl ValidatedPack {
                 let instant_fn = clock_instant_fn(self.images());
                 resolve(self.images(), at, crossfade_duration, &instant_fn)
             }
+            AnchorKind::Period => {
+                let Some(location) = location else {
+                    panic!("ValidatedPack::query: a Location is required for period-anchored packs");
+                };
+                let instant_fn = period_instant_fn(self.images(), location);
+                resolve(self.images(), at, crossfade_duration, &instant_fn)
+            }
         }
     }
 
@@ -314,20 +321,45 @@ impl ValidatedPack {
     }
 }
 
+/// The concrete instant `anchor` resolves to on `date`. `None` when it doesn't occur
+/// that day (polar gap, DST gap, zero-length block) or when a solar/period anchor is
+/// given no location.
+pub fn anchor_instant(anchor: &TimeAnchor, location: Option<&Location>, date: NaiveDate) -> Option<DateTime<Local>> {
+    match *anchor {
+        TimeAnchor::Clock(time) => resolve_clock_instant(date, time),
+        TimeAnchor::Solar { event, offset } => solar::resolve_solar_anchor(location?, date, event, offset),
+        TimeAnchor::Period { period, slot, of } => {
+            crate::periods::boundaries_cached(location?, date)?.slot_instant(period, slot, of)
+        }
+    }
+}
+
 fn solar_instant_fn<'a>(
     images: &'a [PackImage],
     location: &'a Location,
 ) -> impl Fn(NaiveDate, usize) -> Option<DateTime<Local>> + 'a {
     move |date, idx| match images[idx].anchor {
         TimeAnchor::Solar { event, offset } => solar::resolve_solar_anchor(location, date, event, offset),
-        TimeAnchor::Clock(_) => None,
+        TimeAnchor::Clock(_) | TimeAnchor::Period { .. } => None,
+    }
+}
+
+fn period_instant_fn<'a>(
+    images: &'a [PackImage],
+    location: &'a Location,
+) -> impl Fn(NaiveDate, usize) -> Option<DateTime<Local>> + 'a {
+    move |date, idx| match images[idx].anchor {
+        TimeAnchor::Period { period, slot, of } => {
+            crate::periods::boundaries_cached(location, date)?.slot_instant(period, slot, of)
+        }
+        TimeAnchor::Solar { .. } | TimeAnchor::Clock(_) => None,
     }
 }
 
 fn clock_instant_fn(images: &[PackImage]) -> impl Fn(NaiveDate, usize) -> Option<DateTime<Local>> + '_ {
     move |date, idx| match images[idx].anchor {
         TimeAnchor::Clock(time) => resolve_clock_instant(date, time),
-        TimeAnchor::Solar { .. } => None,
+        TimeAnchor::Solar { .. } | TimeAnchor::Period { .. } => None,
     }
 }
 

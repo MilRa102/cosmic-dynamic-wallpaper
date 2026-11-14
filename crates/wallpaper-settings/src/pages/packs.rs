@@ -10,6 +10,8 @@ use cosmic::widget;
 use cosmic::Element;
 use pack_loader::{PackRegistryEntry, PackSource, Registry, RegistryStatus};
 
+use crate::i18n::{tr, trf};
+
 /// The pencil/trash-can icon names (spec 012 FR-001, research.md R7), matching
 /// `pages::location`'s existing `widget::button::icon`/`widget::icon::from_name`
 /// pattern rather than introducing a new icon convention. `pencil-symbolic` (not the
@@ -64,9 +66,9 @@ pub fn rows_from_registry(entries: &[PackRegistryEntry]) -> Vec<PackRow> {
                 RegistryStatus::Unavailable => "unavailable",
             };
             let name = pack_display::resolve_pack_display_name(&entry.source, entry.display_name.as_deref())
-                .unwrap_or_else(|| "(unnamed pack)".to_string());
+                .unwrap_or_else(|| tr("(unnamed pack)"));
             let author = pack_display::resolve_pack_author(&entry.source)
-                .unwrap_or_else(|| UNKNOWN_AUTHOR.to_string());
+                .unwrap_or_else(|| tr(UNKNOWN_AUTHOR));
             let thumbnail = pack_display::resolve_thumbnail_path(&entry.source);
             PackRow { name, source: entry.source.clone(), status, author, thumbnail }
         })
@@ -305,12 +307,12 @@ fn row_actions(row: &PackRow) -> Element<'_, Message> {
     let edit_message = edit_message_for(row);
     let edit_icon = widget::tooltip(
         widget::button::icon(widget::icon::from_name(EDIT_ICON)).on_press_maybe(edit_message),
-        widget::text::body("Edit"),
+        widget::text::body(tr("Edit")),
         widget::tooltip::Position::Top,
     );
     let delete_icon = widget::tooltip(
         widget::button::icon(widget::icon::from_name(DELETE_ICON)).on_press(Message::RemoveRequested(row.source.clone())),
-        widget::text::body("Delete"),
+        widget::text::body(tr("Delete")),
         widget::tooltip::Position::Top,
     );
     widget::row::with_capacity(2)
@@ -328,23 +330,23 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let add_file_message = if state.dialog_in_flight { None } else { Some(Message::AddFileRequested) };
     let add_row = widget::row::with_capacity(3)
         .spacing(cosmic::theme::spacing().space_xs)
-        .push(widget::button::standard("Add pack folder…").on_press_maybe(add_folder_message))
-        .push(widget::button::standard("Add image file…").on_press_maybe(add_file_message))
-        .push(widget::button::standard("Refresh").on_press(Message::Refresh));
+        .push(widget::button::standard(tr("Add pack folder…")).on_press_maybe(add_folder_message))
+        .push(widget::button::standard(tr("Add image file…")).on_press_maybe(add_file_message))
+        .push(widget::button::standard(tr("Refresh")).on_press(Message::Refresh));
 
     let mut top = widget::column::with_capacity(2).push(add_row);
     if let Some(reason) = &state.add_error {
-        top = top.push(widget::text::body(format!("Couldn't add pack: {reason}")));
+        top = top.push(widget::text::body(trf("Couldn't add pack: {reason}", &[("reason", reason)])));
     }
     // Spec 012 FR-019: `open_for_edit`'s refusal reason — there's no wizard `State` for
     // a dialog to attach to in this case, so it's shown inline here instead.
     if let Some(reason) = &state.edit_error {
-        top = top.push(widget::text::body(format!("Couldn't edit pack: {reason}")));
+        top = top.push(widget::text::body(trf("Couldn't edit pack: {reason}", &[("reason", reason)])));
     }
 
-    let mut section = widget::settings::section().title("Registered packs");
+    let mut section = widget::settings::section().title(tr("Registered packs"));
     if state.rows.is_empty() {
-        section = section.add(widget::text::body("No packs registered yet. Add one above."));
+        section = section.add(widget::text::body(tr("No packs registered yet. Add one above.")));
     } else {
         // Labeled Name/Author/Thumbnail columns (status is intentionally not shown
         // here), spaced apart so the row doesn't feel crowded; Name and Author are
@@ -352,15 +354,15 @@ pub fn view(state: &State) -> Element<'_, Message> {
         // page or crowd its neighbors.
         let header = widget::row::with_capacity(3)
             .spacing(cosmic::theme::spacing().space_m)
-            .push(widget::text::caption_heading("Name").width(NAME_COLUMN_WIDTH))
-            .push(widget::text::caption_heading("Author").width(AUTHOR_COLUMN_WIDTH))
-            .push(widget::text::caption_heading("Thumbnail").width(THUMBNAIL_COLUMN_WIDTH));
+            .push(widget::text::caption_heading(tr("Name")).width(NAME_COLUMN_WIDTH))
+            .push(widget::text::caption_heading(tr("Author")).width(AUTHOR_COLUMN_WIDTH))
+            .push(widget::text::caption_heading(tr("Thumbnail")).width(THUMBNAIL_COLUMN_WIDTH));
         section = section.add(header);
 
         for row in &state.rows {
             let thumbnail: Element<'_, Message> = match &row.thumbnail {
-                Some(path) => widget::image(path.clone()).width(THUMBNAIL_COLUMN_WIDTH).height(THUMBNAIL_COLUMN_WIDTH).into(),
-                None => widget::text::caption("(no preview available)").into(),
+                Some(path) => crate::thumbnail::view(path, THUMBNAIL_COLUMN_WIDTH, THUMBNAIL_COLUMN_WIDTH),
+                None => widget::text::caption(tr("(no preview available)")).into(),
             };
             let detail = widget::row::with_capacity(4)
                 .spacing(cosmic::theme::spacing().space_m)
@@ -382,11 +384,11 @@ pub fn rename_dialog(state: &State) -> Option<Element<'_, Message>> {
     let pending = state.pending_rename.as_ref()?;
     Some(
         widget::dialog()
-            .title("Rename pack")
-            .body("This changes only what's shown in this app — the file itself keeps its name.")
-            .control(widget::text_input::text_input("Display name", &pending.name).on_input(Message::RenameNameChanged))
-            .primary_action(widget::button::suggested("Save").on_press(Message::RenameConfirmed))
-            .secondary_action(widget::button::standard("Cancel").on_press(Message::RenameCancelled))
+            .title(tr("Rename pack"))
+            .body(tr("This changes only what's shown in this app — the file itself keeps its name."))
+            .control(widget::text_input::text_input(tr("Display name"), &pending.name).on_input(Message::RenameNameChanged))
+            .primary_action(widget::button::suggested(tr("Save")).on_press(Message::RenameConfirmed))
+            .secondary_action(widget::button::standard(tr("Cancel")).on_press(Message::RenameCancelled))
             .into(),
     )
 }

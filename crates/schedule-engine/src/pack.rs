@@ -90,6 +90,15 @@ pub enum AnchorKind {
     Solar,
     /// Every anchor in the pack is [`TimeAnchor::Clock`].
     Clock,
+    /// Every anchor in the pack is [`TimeAnchor::Period`].
+    Period,
+}
+
+impl AnchorKind {
+    /// `true` if resolving this kind needs a [`crate::Location`].
+    pub fn needs_location(self) -> bool {
+        matches!(self, AnchorKind::Solar | AnchorKind::Period)
+    }
 }
 
 /// An unvalidated collection of images, as supplied by a caller (e.g. spec 2's pack
@@ -112,17 +121,12 @@ impl WallpaperPack {
             return Err(PackError::TooManyAnchors { count: images.len() });
         }
 
-        let anchor_kind = if images[0].anchor.is_solar() {
-            AnchorKind::Solar
-        } else {
-            AnchorKind::Clock
-        };
-        let uniform = images.iter().all(|img| match anchor_kind {
-            AnchorKind::Solar => img.anchor.is_solar(),
-            AnchorKind::Clock => img.anchor.is_clock(),
-        });
-        if !uniform {
+        let anchor_kind = images[0].anchor.kind();
+        if images.iter().any(|img| img.anchor.kind() != anchor_kind) {
             return Err(PackError::MixedAnchorTypes);
+        }
+        if anchor_kind == AnchorKind::Period {
+            check_period_slots(&images)?;
         }
 
         // Spec 011 US1 FR-004 (research.md R4): bound every solar anchor's offset
@@ -169,6 +173,29 @@ impl WallpaperPack {
     }
 }
 
+/// Every block's slots must be exactly `0..n`, each declaring `of == n`.
+fn check_period_slots(images: &[PackImage]) -> Result<(), PackError> {
+    use crate::periods::SolarPeriod;
+    let mut slots: [Vec<(u8, u8)>; SolarPeriod::COUNT] = Default::default();
+    for img in images {
+        if let TimeAnchor::Period { period, slot, of } = img.anchor {
+            slots[period.index()].push((slot, of));
+        }
+    }
+    for (period, mut entries) in SolarPeriod::ALL.into_iter().zip(slots) {
+        entries.sort_unstable();
+        let n = entries.len();
+        let consistent = entries
+            .iter()
+            .enumerate()
+            .all(|(i, &(slot, of))| usize::from(slot) == i && usize::from(of) == n);
+        if !consistent {
+            return Err(PackError::InvalidPeriodSlots { period });
+        }
+    }
+    Ok(())
+}
+
 /// A structurally valid pack, ready to be queried (data-model.md "WallpaperPack
 /// (validated form)"; contracts/schedule-engine-api.md's `ValidatedPack`).
 ///
@@ -199,7 +226,12 @@ impl ValidatedPack {
         self.images.is_empty()
     }
 
-    /// Whether this pack is solar- or clock-anchored (FR-6).
+    /// For a period-anchored pack, its images arranged by block.
+    pub fn period_layout(&self) -> Option<crate::PeriodLayout> {
+        crate::PeriodLayout::from_images(&self.images)
+    }
+
+    /// Whether this pack is solar-, clock- or period-anchored (FR-6).
     pub fn anchor_kind(&self) -> AnchorKind {
         self.anchor_kind
     }

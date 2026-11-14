@@ -52,7 +52,7 @@ anchor = "sunset-30m"
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `schema_version` | integer | yes | Currently must be `1`. A newer loader may support future versions with a documented migration; an older loader rejects a `schema_version` it doesn't understand yet, with a clear error — it will never silently guess. |
+| `schema_version` | integer | yes | `1`, or `2` for packs that use `period` entries (see below). A newer loader may support future versions with a documented migration; an older loader rejects a `schema_version` it doesn't understand yet, with a clear error — it will never silently guess. |
 | `name` | string | yes | Display name for the pack. Two packs may share a `name` without conflict — a pack's real identity is its directory location, not this field. |
 | `author` | string | no | Free-form author/license note (e.g. `"Jane Author — CC-BY-4.0"`). |
 | `default_scaling` | string | yes | One of `Fill`, `Fit`, `Stretch`, `Center` (case-insensitive). Applies to every image that doesn't declare its own `scaling`. |
@@ -64,12 +64,13 @@ anchor = "sunset-30m"
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `file` | string | yes | Path to the image, relative to the manifest's own directory. Must stay inside that directory — `..`, an absolute path, or a symlink pointing outside the pack is rejected. |
-| `anchor` | string | yes | When this image becomes active — see "Anchor grammar" below. |
+| `anchor` | string | one of `anchor`/`period` | When this image becomes active — see "Anchor grammar" below. |
+| `period` | string | one of `anchor`/`period` | Schema 2 only: the part of the day this image belongs to — see "Solar periods" below. |
 | `scaling` | string | no | Overrides `default_scaling` for this one image. |
 
-**All images in one pack must use the same *kind* of anchor** — either every image is
-anchored to a solar event, or every image is anchored to a clock time. Mixing the two
-kinds in one manifest is rejected.
+**All images in one pack must use the same *kind* of anchor** — every image is
+anchored to a solar event, every image to a clock time, or every image to a solar
+period. Mixing kinds in one manifest is rejected.
 
 ### Anchor grammar
 
@@ -105,6 +106,47 @@ latitude/longitude); no anchor line in the manifest itself sets location.
 ```
 
 Clock anchors require no location at all.
+
+### Solar periods (schema 2)
+
+Instead of an exact anchor, an image can name the part of the day it belongs to; the
+times are then computed for the configured location and date, never written down:
+
+```toml
+schema_version = 2
+
+[[images]]
+file = "morning-1.jpg"
+period = "morning"
+
+[[images]]
+file = "morning-2.jpg"
+period = "morning"
+```
+
+There are four parts of the day, in day order: `morning`, `day`, `evening`, `night`.
+With T = solar noon and H(h) = the half-arc from noon until the sun sits at elevation h:
+
+| Period | From | To |
+|---|---|---|
+| `morning` | civil dawn (T − H(−6°)) | T − H(horizon)/2 |
+| `day` | T − H(horizon)/2 | T + H(horizon)/2 |
+| `evening` | T + H(horizon)/2 | civil dusk (T + H(−6°)) |
+| `night` | civil dusk | the next civil dawn |
+
+So `day` is the middle half of daylight, and `night` crosses midnight.
+
+- Images of one period split its interval evenly, in manifest order.
+- A period with no images keeps showing the previous period's last image, so the
+  schedule always covers the whole day.
+- A period that doesn't occur on a date (no `day` in polar night, no `night` in polar
+  day) is skipped; its images get no time that day.
+- Older packs that used the twelve finer block names keep loading: `civil_dawn`,
+  `sunrise` → `morning`; `noon`, `afternoon` → `day`; `sunset`, `civil_dusk` →
+  `evening`; `nautical_dusk`, `astronomical_dusk`, `astronomical_dawn`, `nautical_dawn`
+  → `night`. Merged images stay in chronological order. The editor saves the new names.
+
+Period packs require a location, like solar anchors.
 
 ### Duplicate anchors
 

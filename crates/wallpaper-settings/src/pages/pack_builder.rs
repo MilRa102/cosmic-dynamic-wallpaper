@@ -45,12 +45,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, NaiveTime, TimeDelta, Timelike};
+use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeDelta, Timelike};
+use cosmic::iced::Length;
 use cosmic::widget;
 use cosmic::Element;
 use image::ImageReader;
 use pack_loader::{Color, ManifestDraft, ManifestDraftImage, PackSource, Registry, ScalingMode};
-use schedule_engine::{AnchorKind, Location, PackError, PackImage, SolarEventKind, TimeAnchor, WallpaperPack};
+use schedule_engine::{
+    AnchorKind, ImageId, Location, PackError, PackImage, PeriodLayout, ResolvedSchedule, SolarEventKind, SolarPeriod, TimeAnchor,
+    WallpaperPack,
+};
+
+use crate::i18n::{tr, trf};
 
 /// The 8 recognized solar events, in the order shown in the dropdown (FR-005).
 pub const SOLAR_EVENTS: [SolarEventKind; 8] = [
@@ -64,8 +70,8 @@ pub const SOLAR_EVENTS: [SolarEventKind; 8] = [
     SolarEventKind::AstronomicalDusk,
 ];
 
-fn solar_event_label(event: SolarEventKind) -> &'static str {
-    match event {
+fn solar_event_label(event: SolarEventKind) -> String {
+    tr(match event {
         SolarEventKind::Sunrise => "Sunrise",
         SolarEventKind::Sunset => "Sunset",
         SolarEventKind::SolarNoon => "Solar noon",
@@ -74,10 +80,10 @@ fn solar_event_label(event: SolarEventKind) -> &'static str {
         SolarEventKind::CivilDusk => "Civil dusk",
         SolarEventKind::AstronomicalDawn => "Astronomical dawn",
         SolarEventKind::AstronomicalDusk => "Astronomical dusk",
-    }
+    })
 }
 
-fn solar_event_labels() -> Vec<&'static str> {
+fn solar_event_labels() -> Vec<String> {
     SOLAR_EVENTS.iter().copied().map(solar_event_label).collect()
 }
 
@@ -88,8 +94,21 @@ fn solar_event_labels() -> Vec<&'static str> {
 /// since a pack cannot mix solar and clock anchors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentMode {
+    /// Images are dragged into fixed solar blocks; their times are derived from the
+    /// block boundaries for the configured location and date (`TimeAnchor::Period`).
+    SolarBlocks,
     SolarPeriod,
     SpecificTime,
+}
+
+/// Display label for a solar block.
+pub fn period_label(period: SolarPeriod) -> String {
+    tr(match period {
+        SolarPeriod::Morning => "Morning",
+        SolarPeriod::Day => "Day",
+        SolarPeriod::Evening => "Evening",
+        SolarPeriod::Night => "Night",
+    })
 }
 
 /// One image's solar-period assignment — an event plus a signed hour/minute offset,
@@ -112,12 +131,23 @@ pub struct ImageRow {
     pub thumbnail_path: PathBuf,
     pub solar: Option<SolarAssignment>,
     pub time: Option<NaiveTime>,
+    /// `SolarBlocks` mode: the block this image sits in (`None` = not included in the
+    /// pack). The order of rows sharing a block in `State.rows` is the order within it.
+    pub period: Option<SolarPeriod>,
 }
 
 impl ImageRow {
     fn new(file_name: String, thumbnail_path: PathBuf) -> Self {
-        Self { file_name, thumbnail_path, solar: None, time: None }
+        Self { file_name, thumbnail_path, solar: None, time: None, period: None }
     }
+}
+
+/// Where a dragged image would land: before the `index`-th image of `block` (`None` =
+/// the "not included" tray); `index` equal to the block's length means "at the end".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTarget {
+    pub block: Option<SolarPeriod>,
+    pub index: usize,
 }
 
 /// Where the just-generated manifest currently sits, awaiting the move-vs-keep choice
@@ -193,11 +223,38 @@ pub struct State {
     /// Spec 012 FR-009: captured once by `open_for_edit`, threaded into `build_draft`
     /// unchanged by anything this screen does. `None` for the add flow.
     pub preserved: Option<PreservedManifestFields>,
+    /// Location the blocks editor previews computed times for — refreshed by `app.rs`
+    /// whenever the wizard opens. `None` hides the times (blocks stay editable).
+    pub location: Option<Location>,
+    /// Date the blocks editor previews (defaults to today).
+    pub preview_date: NaiveDate,
+    /// File name of the image currently being dragged in the blocks editor.
+    pub dragging: Option<String>,
+    pub drop_target: Option<DropTarget>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     ModeChosen(AssignmentMode),
+    /// Blocks editor: mouse pressed on an image — starts dragging it.
+    DragStarted(String),
+    /// Blocks editor: the cursor entered a drop position while dragging.
+    DragEntered(DropTarget),
+    /// Blocks editor: the cursor left a drop position.
+    DragLeft(DropTarget),
+    /// Blocks editor: mouse released anywhere — drops on the current target, if any.
+    DragReleased,
+    /// Blocks editor: a pane scrolled — the hovered drop position is stale until the
+    /// cursor moves again (hover is only tracked on cursor motion).
+    DragScrolled,
+    /// Blocks editor: keyboard-friendly alternative to dragging.
+    BlockSelected(String, Option<SolarPeriod>),
+    /// Blocks editor: move an image one position earlier (`-1`) or later (`+1`) in its block.
+    MoveWithinBlock(String, i32),
+    /// Blocks editor: show computed times for another day (`0` = back to today).
+    PreviewDayShifted(i64),
+    /// Convert the current event/clock assignments into solar blocks.
+    ConvertToBlocks,
     Cancelled,
     /// `(row, index into SOLAR_EVENTS)`.
     SolarEventSelected(usize, usize),
@@ -262,6 +319,10 @@ pub fn open(source_dir: PathBuf) -> State {
         pending_manifest_text: None,
         edit_target: None,
         preserved: None,
+        location: None,
+        preview_date: Local::now().date_naive(),
+        dragging: None,
+        drop_target: None,
     }
 }
 
@@ -285,22 +346,23 @@ pub fn open(source_dir: PathBuf) -> State {
 /// partially-populated wizard should paper over.
 pub fn open_for_edit(source_dir: PathBuf, source: PackSource) -> Result<State, String> {
     if !matches!(source, PackSource::Directory(_)) {
-        return Err(format!("{} is a single image, not a folder pack — it has no schedule to edit here.", source_dir.display()));
+        return Err(trf("{path} is a single image, not a folder pack — it has no schedule to edit here.", &[("path", &source_dir.display().to_string())]));
     }
     let loaded = pack_loader::load_pack(&source_dir).map_err(|e| e.to_string())?;
 
     for image in loaded.pack.images() {
         if let TimeAnchor::Solar { offset, .. } = image.anchor {
             if !offset_within_wizard_range(offset) {
-                return Err(format!(
-                    "{} has a solar offset wider than this editor's ±12h range — edit its manifest.toml directly.",
-                    image.id
+                return Err(trf(
+                    "{id} has a solar offset wider than this editor's ±12h range — edit its manifest.toml directly.",
+                    &[("id", &image.id.to_string())],
                 ));
             }
         }
     }
 
     let mode = match loaded.pack.anchor_kind() {
+        AnchorKind::Period => AssignmentMode::SolarBlocks,
         AnchorKind::Solar => AssignmentMode::SolarPeriod,
         AnchorKind::Clock => AssignmentMode::SpecificTime,
     };
@@ -319,7 +381,19 @@ pub fn open_for_edit(source_dir: PathBuf, source: PackSource) -> Result<State, S
                 row.solar = Some(SolarAssignment { event, offset_negative, offset_hours, offset_minutes });
             }
             TimeAnchor::Clock(time) => row.time = Some(time),
+            TimeAnchor::Period { period, .. } => row.period = Some(period),
         }
+    }
+    if mode == AssignmentMode::SolarBlocks {
+        // Rows follow block order, then slot order within a block; images not in the
+        // manifest go to the "not included" tray at the end. `sort_by_key` is stable.
+        let slot_of = |name: &str| {
+            loaded.pack.images().iter().find(|img| img.id.as_str() == name).and_then(|img| match img.anchor {
+                TimeAnchor::Period { period, slot, .. } => Some((period.index(), slot)),
+                _ => None,
+            })
+        };
+        rows.sort_by_key(|row| slot_of(&row.file_name).unwrap_or((SolarPeriod::COUNT, 0)));
     }
 
     let per_image_scaling = loaded
@@ -348,6 +422,10 @@ pub fn open_for_edit(source_dir: PathBuf, source: PackSource) -> Result<State, S
             fallback_color: loaded.fallback_color,
             per_image_scaling,
         }),
+        location: None,
+        preview_date: Local::now().date_naive(),
+        dragging: None,
+        drop_target: None,
     })
 }
 
@@ -356,7 +434,8 @@ pub fn open_for_edit(source_dir: PathBuf, source: PackSource) -> Result<State, S
 /// subdirectories, a stray `manifest.toml`). Fails with a specific message for FR-018's
 /// two boundary cases — no usable images, or more than `schedule_engine::MAX_ANCHORS`.
 fn scan_folder(dir: &Path) -> Result<Vec<ImageRow>, String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("couldn't read {}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| trf("couldn't read {path}: {error}", &[("path", &dir.display().to_string()), ("error", &e.to_string())]))?;
 
     let mut rows = Vec::new();
     for entry in entries.flatten() {
@@ -372,14 +451,16 @@ fn scan_folder(dir: &Path) -> Result<Vec<ImageRow>, String> {
     rows.sort_by(|a, b| a.file_name.cmp(&b.file_name));
 
     if rows.is_empty() {
-        return Err(format!("{} has no readable images to build a pack from.", dir.display()));
+        return Err(trf("{path} has no readable images to build a pack from.", &[("path", &dir.display().to_string())]));
     }
     if rows.len() > schedule_engine::MAX_ANCHORS {
-        return Err(format!(
-            "{} has {} images — a single pack can hold at most {}.",
-            dir.display(),
-            rows.len(),
-            schedule_engine::MAX_ANCHORS
+        return Err(trf(
+            "{path} has {count} images — a single pack can hold at most {max}.",
+            &[
+                ("path", &dir.display().to_string()),
+                ("count", &rows.len().to_string()),
+                ("max", &schedule_engine::MAX_ANCHORS.to_string()),
+            ],
         ));
     }
     Ok(rows)
@@ -474,12 +555,26 @@ pub fn effective_name(input: &str, fallback: &str) -> String {
 
 /// FR-009: every row must have an explicit assignment before Generate is available. An
 /// empty row list is never "all assigned" — there'd be nothing to generate.
+///
+/// `SolarBlocks` is the exception: images left in the "not included" tray are simply
+/// omitted from the pack, so only at least one placed image is required.
 pub fn all_assigned(rows: &[ImageRow], mode: AssignmentMode) -> bool {
-    !rows.is_empty()
-        && rows.iter().all(|row| match mode {
-            AssignmentMode::SolarPeriod => row.solar.is_some(),
-            AssignmentMode::SpecificTime => row.time.is_some(),
-        })
+    match mode {
+        AssignmentMode::SolarBlocks => rows.iter().any(|row| row.period.is_some()),
+        AssignmentMode::SolarPeriod => !rows.is_empty() && rows.iter().all(|row| row.solar.is_some()),
+        AssignmentMode::SpecificTime => !rows.is_empty() && rows.iter().all(|row| row.time.is_some()),
+    }
+}
+
+/// The static block layout described by `rows` (`SolarBlocks` mode).
+pub fn rows_layout(rows: &[ImageRow]) -> PeriodLayout {
+    let mut layout = PeriodLayout::new();
+    for row in rows {
+        if let Some(period) = row.period {
+            layout.block_mut(period).push(ImageId::new(row.file_name.clone()));
+        }
+    }
+    layout
 }
 
 fn solar_row_anchor(assignment: SolarAssignment) -> TimeAnchor {
@@ -508,10 +603,16 @@ pub fn build_draft(
     author: &str,
     preserved: Option<&PreservedManifestFields>,
 ) -> ManifestDraft {
+    let layout = rows_layout(rows);
     let images = rows
         .iter()
         .filter_map(|row| {
             let anchor = match mode {
+                AssignmentMode::SolarBlocks => row.period.and_then(|period| {
+                    let block = layout.block(period);
+                    let slot = block.iter().position(|id| id.as_str() == row.file_name)?;
+                    Some(TimeAnchor::Period { period, slot: u8::try_from(slot).ok()?, of: u8::try_from(block.len()).ok()? })
+                }),
                 AssignmentMode::SolarPeriod => row.solar.map(solar_row_anchor),
                 AssignmentMode::SpecificTime => row.time.map(TimeAnchor::clock),
             }?;
@@ -534,6 +635,8 @@ pub fn build_draft(
 /// conflicts between rows that *are* assigned.
 pub fn detect_conflict(rows: &[ImageRow], mode: AssignmentMode, location: Option<Location>) -> Option<String> {
     match mode {
+        // Slots are spread evenly inside a block, so two images can never collide.
+        AssignmentMode::SolarBlocks => None,
         AssignmentMode::SolarPeriod => detect_solar_conflict(rows, location),
         AssignmentMode::SpecificTime => detect_clock_conflict(rows),
     }
@@ -553,9 +656,9 @@ fn detect_solar_conflict(rows: &[ImageRow], location: Option<Location>) -> Optio
                 && a.offset_hours == other.offset_hours
                 && a.offset_minutes == other.offset_minutes
             {
-                return Some(format!(
-                    "Two images are both scheduled for {} — pick a different event or offset for one of them.",
-                    solar_event_label(a.event)
+                return Some(trf(
+                    "Two images are both scheduled for {event} — pick a different event or offset for one of them.",
+                    &[("event", &solar_event_label(a.event))],
                 ));
             }
         }
@@ -570,7 +673,7 @@ fn detect_solar_conflict(rows: &[ImageRow], location: Option<Location>) -> Optio
     match WallpaperPack::validate(pack_images) {
         Ok(validated) => match validated.check_solar_duplicate_instant(&location, Local::now().date_naive()) {
             Ok(()) => None,
-            Err(_) => Some("Two images resolve to the same moment today — adjust one of their offsets.".to_string()),
+            Err(_) => Some(tr("Two images resolve to the same moment today — adjust one of their offsets.")),
         },
         // Empty/TooManyAnchors/MixedAnchorTypes aren't reachable through this UI's own
         // rows (scan_folder/set_mode already rule them out) — not this check's concern.
@@ -587,7 +690,7 @@ fn detect_clock_conflict(rows: &[ImageRow]) -> Option<String> {
         rows.iter().filter_map(|r| r.time.map(|t| PackImage::new(r.file_name.clone(), TimeAnchor::clock(t)))).collect();
     match WallpaperPack::validate(pack_images) {
         Err(PackError::DuplicateInstant) => {
-            Some("Two images are set to the exact same time — pick a different time for one of them.".to_string())
+            Some(tr("Two images are set to the exact same time — pick a different time for one of them."))
         }
         _ => None,
     }
@@ -607,9 +710,173 @@ pub fn set_mode(state: &mut State, mode: AssignmentMode) {
     for row in &mut state.rows {
         row.solar = None;
         row.time = None;
+        row.period = None;
     }
     state.conflict = None;
     state.generate_error = None;
+    state.dragging = None;
+    state.drop_target = None;
+}
+
+// --- Solar blocks editor ---
+
+/// Moves the row named `file_name` into `block` (`None` = the "not included" tray),
+/// before the `index`-th row currently in that block (indices counted *before* the
+/// move, so dropping an image onto its own position is a no-op). Other blocks' rows
+/// keep their relative order — only the target block's times change.
+pub fn place_row(rows: &mut Vec<ImageRow>, file_name: &str, block: Option<SolarPeriod>, index: usize) {
+    let Some(from) = rows.iter().position(|r| r.file_name == file_name) else { return };
+    let members: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.period == block).map(|(i, _)| i).collect();
+    // Absolute insertion point in the pre-removal vector.
+    let insert_at = match members.get(index) {
+        Some(&i) => i,
+        None => match members.last() {
+            Some(&last) => last + 1,
+            None => block_insertion_point(rows, block, from),
+        },
+    };
+    let mut row = rows.remove(from);
+    row.period = block;
+    let insert_at = if from < insert_at { insert_at - 1 } else { insert_at };
+    rows.insert(insert_at.min(rows.len()), row);
+}
+
+/// Where an empty `block` would start in `rows`: just before the first row of any later
+/// block (the tray counts as the last), ignoring the row being moved.
+fn block_insertion_point(rows: &[ImageRow], block: Option<SolarPeriod>, moving: usize) -> usize {
+    let rank = |p: Option<SolarPeriod>| p.map_or(SolarPeriod::COUNT, SolarPeriod::index);
+    rows.iter()
+        .enumerate()
+        .find(|(i, r)| *i != moving && rank(r.period) > rank(block))
+        .map_or(rows.len(), |(i, _)| i)
+}
+
+/// Moves an image one position earlier/later inside its own block.
+pub fn move_within_block(state: &mut State, file_name: &str, delta: i32) {
+    let Some(row) = state.rows.iter().find(|r| r.file_name == file_name) else { return };
+    let block = row.period;
+    let members: Vec<&str> = state.rows.iter().filter(|r| r.period == block).map(|r| r.file_name.as_str()).collect();
+    let Some(pos) = members.iter().position(|n| *n == file_name) else { return };
+    // `place_row` indexes before removal: moving later by one means "before the item
+    // two positions ahead".
+    let target = match delta {
+        d if d < 0 && pos > 0 => pos - 1,
+        d if d > 0 && pos + 1 < members.len() => pos + 2,
+        _ => return,
+    };
+    place_row(&mut state.rows, file_name, block, target);
+}
+
+pub fn select_block(state: &mut State, file_name: &str, block: Option<SolarPeriod>) {
+    let current = state.rows.iter().find(|r| r.file_name == file_name).map(|r| r.period);
+    if current != Some(block) {
+        place_row(&mut state.rows, file_name, block, usize::MAX);
+    }
+}
+
+pub fn start_drag(state: &mut State, file_name: String) {
+    state.dragging = Some(file_name);
+    state.drop_target = None;
+}
+
+pub fn drag_entered(state: &mut State, target: DropTarget) {
+    if state.dragging.is_some() {
+        state.drop_target = Some(target);
+    }
+}
+
+pub fn drag_scrolled(state: &mut State) {
+    state.drop_target = None;
+}
+
+pub fn drag_left(state: &mut State, target: DropTarget) {
+    if state.drop_target == Some(target) {
+        state.drop_target = None;
+    }
+}
+
+/// Ends a drag: drops onto the hovered target, or cancels when released elsewhere.
+pub fn release_drag(state: &mut State) {
+    if let (Some(name), Some(target)) = (state.dragging.take(), state.drop_target.take()) {
+        place_row(&mut state.rows, &name, target.block, target.index);
+    }
+}
+
+pub fn shift_preview_day(state: &mut State, days: i64) {
+    let today = Local::now().date_naive();
+    state.preview_date = if days == 0 { today } else { state.preview_date + TimeDelta::days(days) };
+}
+
+/// The block an event opens (or, for noon/midnight, sits in) — used when converting an
+/// un-offset event anchor, whose instant lies exactly on a block edge and could
+/// otherwise round into the previous block, and for events that don't happen on the
+/// conversion day (polar day/night).
+fn fallback_period(event: SolarEventKind) -> SolarPeriod {
+    match event {
+        SolarEventKind::CivilDawn | SolarEventKind::Sunrise => SolarPeriod::Morning,
+        SolarEventKind::SolarNoon => SolarPeriod::Day,
+        SolarEventKind::Sunset => SolarPeriod::Evening,
+        SolarEventKind::CivilDusk
+        | SolarEventKind::AstronomicalDusk
+        | SolarEventKind::SolarMidnight
+        | SolarEventKind::AstronomicalDawn => SolarPeriod::Night,
+    }
+}
+
+/// Converts the rows' event (`SolarPeriod`) or clock (`SpecificTime`) assignments into
+/// solar blocks: each image goes into the block its moment falls in on `date` at
+/// `location`, ordered by that moment. Unassigned images land in the tray. The
+/// resulting schedule looks the same as before for that day, but adapts across the
+/// year from then on.
+pub fn convert_rows_to_blocks(rows: &mut Vec<ImageRow>, location: &Location, date: NaiveDate) {
+    let day_span = schedule_engine::PeriodBoundaries::compute(location, date).map(|b| b.day_span());
+    let mut keyed: Vec<(usize, i64, ImageRow)> = rows
+        .drain(..)
+        .map(|mut row| {
+            let anchor = row.solar.map(solar_row_anchor).or(row.time.map(TimeAnchor::clock));
+            let instant: Option<DateTime<Local>> =
+                anchor.as_ref().and_then(|a| schedule_engine::anchor_instant(a, Some(location), date));
+            let period = match (instant, anchor) {
+                (_, Some(TimeAnchor::Solar { event, offset: None })) | (None, Some(TimeAnchor::Solar { event, .. })) => {
+                    Some(fallback_period(event))
+                }
+                (Some(at), _) => schedule_engine::period_at(location, at),
+                _ => None,
+            };
+            // Order inside a block by position within the solar day: this evening's
+            // night belongs before this morning's (it starts the next solar day's Night
+            // block), and a time after local midnight but before the solar day starts
+            // continues the previous evening's block.
+            let key = instant.map_or(i64::MAX, |at| {
+                let at = match day_span {
+                    Some((_, end)) if at >= end => at - TimeDelta::days(1),
+                    Some((start, _)) if at < start => at + TimeDelta::days(1),
+                    _ => at,
+                };
+                at.timestamp()
+            });
+            row.solar = None;
+            row.time = None;
+            row.period = period;
+            (period.map_or(SolarPeriod::COUNT, SolarPeriod::index), key, row)
+        })
+        .collect();
+    keyed.sort_by_key(|(rank, key, _)| (*rank, *key));
+    rows.extend(keyed.into_iter().map(|(_, _, row)| row));
+}
+
+pub fn convert_to_blocks(state: &mut State) {
+    let Some(location) = state.location else { return };
+    let date = state.preview_date;
+    convert_rows_to_blocks(&mut state.rows, &location, date);
+    state.mode = Some(AssignmentMode::SolarBlocks);
+    state.conflict = None;
+    state.generate_error = None;
+}
+
+/// Computed times for the blocks editor; `None` without a location.
+pub fn preview_schedule(state: &State) -> Option<ResolvedSchedule> {
+    schedule_engine::resolve_schedule(&rows_layout(&state.rows), state.location.as_ref()?, state.preview_date)
 }
 
 pub fn set_solar_event_by_index(state: &mut State, row: usize, index: usize, location: Option<Location>) {
@@ -725,7 +992,7 @@ pub fn generate(state: &mut State) -> bool {
     // ever bypassed (its own doc comment: "stays total either way"), but this is the
     // check that's actually supposed to prevent that from being reachable at all.
     if !all_assigned(&state.rows, mode) {
-        state.generate_error = Some("every image needs an assignment before a pack can be generated.".to_string());
+        state.generate_error = Some(tr("every image needs an assignment before a pack can be generated."));
         return false;
     }
 
@@ -741,7 +1008,7 @@ pub fn generate(state: &mut State) -> bool {
     // images racing for the same display moment — exactly what FR-012 requires never
     // happen, not just "usually doesn't happen because the button was disabled."
     if state.conflict.is_some() {
-        state.generate_error = Some("resolve the scheduling conflict before generating a pack.".to_string());
+        state.generate_error = Some(tr("resolve the scheduling conflict before generating a pack."));
         return false;
     }
 
@@ -750,7 +1017,7 @@ pub fn generate(state: &mut State) -> bool {
     let text = pack_loader::render(&draft);
 
     if let Err(e) = self_validate_in_scratch_dir(&state.source_dir, &draft, &text) {
-        state.generate_error = Some(format!("the generated pack didn't validate: {e}"));
+        state.generate_error = Some(trf("the generated pack didn't validate: {error}", &[("error", &e.to_string())]));
         return false;
     }
 
@@ -794,10 +1061,10 @@ pub fn generate(state: &mut State) -> bool {
 fn write_edit_manifest(source_dir: &Path, text: &str) -> Result<(), String> {
     let manifest_path = source_dir.join(pack_loader::MANIFEST_FILE_NAME);
     let tmp_path = source_dir.join(format!("{}.tmp-{}", pack_loader::MANIFEST_FILE_NAME, std::process::id()));
-    std::fs::write(&tmp_path, text).map_err(|e| format!("couldn't write the updated manifest: {e}"))?;
+    std::fs::write(&tmp_path, text).map_err(|e| trf("couldn't write the updated manifest: {error}", &[("error", &e.to_string())]))?;
     std::fs::rename(&tmp_path, &manifest_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
-        format!("couldn't replace the existing manifest: {e}")
+        trf("couldn't replace the existing manifest: {error}", &[("error", &e.to_string())])
     })
 }
 
@@ -877,11 +1144,11 @@ enum MoveError {
 /// must specifically not yet exist.
 fn validate_destination_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
-        return Err("the pack name can't be empty.".to_string());
+        return Err(tr("the pack name can't be empty."));
     }
     let only_normal_components = Path::new(name).components().all(|c| matches!(c, std::path::Component::Normal(_)));
     if !only_normal_components || Path::new(name).is_absolute() {
-        return Err("the pack name can't contain path separators, \"..\", or be an absolute path.".to_string());
+        return Err(tr("the pack name can't contain path separators, \"..\", or be an absolute path."));
     }
     Ok(())
 }
@@ -923,16 +1190,16 @@ fn move_pack(generated_path: &Path, destination_root: &Path, name: &str, manifes
     }
     if let Err(e) = std::fs::write(destination.join(pack_loader::MANIFEST_FILE_NAME), manifest_text) {
         let _ = std::fs::remove_dir_all(&destination);
-        return Err(MoveError::Io(format!("couldn't write manifest.toml at the destination: {e}")));
+        return Err(MoveError::Io(trf("couldn't write manifest.toml at the destination: {error}", &[("error", &e.to_string())])));
     }
     if let Err(e) = pack_loader::load_pack(&destination) {
         let _ = std::fs::remove_dir_all(&destination);
-        return Err(MoveError::Io(format!("the moved copy didn't validate: {e}")));
+        return Err(MoveError::Io(trf("the moved copy didn't validate: {error}", &[("error", &e.to_string())])));
     }
     if let Err(e) = std::fs::remove_dir_all(generated_path) {
-        return Err(MoveError::Io(format!(
-            "copied to {} but couldn't remove the original folder: {e}",
-            destination.display()
+        return Err(MoveError::Io(trf(
+            "copied to {path} but couldn't remove the original folder: {error}",
+            &[("path", &destination.display().to_string()), ("error", &e.to_string())],
         )));
     }
     Ok(destination)
@@ -972,7 +1239,10 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 fn register_and_close(state: &mut State, registry: &mut Registry, path: &Path) -> bool {
     let register_result = PackSource::resolve(path).map_err(|e| e.to_string()).and_then(|source| registry.register(source).map_err(|e| e.to_string()));
     if let Err(e) = register_result {
-        state.move_error = Some(format!("pack was generated at {}, but couldn't be registered: {e}", path.display()));
+        state.move_error = Some(trf(
+            "pack was generated at {path}, but couldn't be registered: {error}",
+            &[("path", &path.display().to_string()), ("error", &e.to_string())],
+        ));
         state.pending_placement = Some(GeneratedPlacement { generated_path: path.to_path_buf() });
         state.pending_collision = None;
         return false;
@@ -994,19 +1264,19 @@ fn register_and_close(state: &mut State, registry: &mut Registry, path: &Path) -
 /// half-written manifest and no visible explanation.
 fn write_manifest_and_register(state: &mut State, registry: &mut Registry, path: &Path) -> bool {
     let Some(text) = state.pending_manifest_text.clone() else {
-        state.move_error = Some("internal error: no pending manifest to write — try Generate again.".to_string());
+        state.move_error = Some(tr("internal error: no pending manifest to write — try Generate again."));
         return false;
     };
     let manifest_path = path.join(pack_loader::MANIFEST_FILE_NAME);
     if let Err(e) = std::fs::write(&manifest_path, &text) {
-        state.move_error = Some(format!("couldn't write manifest.toml: {e}"));
+        state.move_error = Some(trf("couldn't write manifest.toml: {error}", &[("error", &e.to_string())]));
         state.pending_placement = Some(GeneratedPlacement { generated_path: path.to_path_buf() });
         state.pending_collision = None;
         return false;
     }
     if let Err(e) = pack_loader::load_pack(path) {
         let _ = std::fs::remove_file(&manifest_path);
-        state.move_error = Some(format!("the generated pack didn't validate: {e}"));
+        state.move_error = Some(trf("the generated pack didn't validate: {error}", &[("error", &e.to_string())]));
         state.pending_placement = Some(GeneratedPlacement { generated_path: path.to_path_buf() });
         state.pending_collision = None;
         return false;
@@ -1021,7 +1291,7 @@ fn finish_move(state: &mut State, registry: &mut Registry, generated_path: &Path
     // itself.
     state.move_error = None;
     let Some(text) = state.pending_manifest_text.clone() else {
-        state.move_error = Some("internal error: no pending manifest to move — try Generate again.".to_string());
+        state.move_error = Some(tr("internal error: no pending manifest to move — try Generate again."));
         return false;
     };
     match move_pack(generated_path, root, name, &text) {
@@ -1057,7 +1327,7 @@ fn finish_move(state: &mut State, registry: &mut Registry, generated_path: &Path
 pub fn confirm_move(state: &mut State, registry: &mut Registry) -> bool {
     let Some(placement) = state.pending_placement.clone() else { return false };
     let Some(root) = standard_pack_location() else {
-        state.move_error = Some("couldn't determine the standard pack location.".to_string());
+        state.move_error = Some(tr("couldn't determine the standard pack location."));
         return false;
     };
     let suggested_name =
@@ -1084,7 +1354,7 @@ pub fn set_collision_name(state: &mut State, name: String) {
 pub fn confirm_collision_move(state: &mut State, registry: &mut Registry) -> bool {
     let Some(pending) = state.pending_collision.clone() else { return false };
     let Some(root) = standard_pack_location() else {
-        state.move_error = Some("couldn't determine the standard pack location.".to_string());
+        state.move_error = Some(tr("couldn't determine the standard pack location."));
         return false;
     };
     state.pending_collision = None;
@@ -1113,82 +1383,417 @@ pub fn view(state: &State) -> Element<'_, Message> {
             Some(mode) => configuration_view(state, mode),
         }
     };
-    widget::scrollable(content).into()
+    // The blocks editor fills the page with its own panes, sized so dragging rarely
+    // needs scrolling; every other screen scrolls as a whole.
+    let blocks_mode = state.scan_error.is_none() && state.mode == Some(AssignmentMode::SolarBlocks);
+    let content = if blocks_mode { content } else { widget::scrollable(content).into() };
+    // Always wrapped (not only while dragging) so the widget tree — and with it the
+    // scroll position — stays stable when a drag starts. A release anywhere ends the
+    // drag; drop targets only record where the cursor is.
+    let mut area = widget::mouse_area(content).on_release(Message::DragReleased);
+    if state.dragging.is_some() {
+        area = area.interaction(cosmic::iced::mouse::Interaction::Grabbing);
+    }
+    area.into()
 }
 
 fn scan_error_view(reason: &str) -> Element<'_, Message> {
     widget::column::with_capacity(2)
         .spacing(cosmic::theme::spacing().space_s)
         .push(widget::text::body(reason.to_string()))
-        .push(widget::button::standard("Cancel").on_press(Message::Cancelled))
+        .push(widget::button::standard(tr("Cancel")).on_press(Message::Cancelled))
         .into()
 }
 
 fn mode_choice_view<'a>() -> Element<'a, Message> {
-    widget::column::with_capacity(3)
+    widget::column::with_capacity(4)
         .spacing(cosmic::theme::spacing().space_m)
-        .push(widget::text::title3("How do you want to schedule these images?"))
+        .push(widget::text::title3(tr("How do you want to schedule these images?")))
+        .push(widget::text::body(tr(
+            "\"By parts of the day\" lets you drag images into morning, day, evening and night — times follow the sun for your location automatically.",
+        )))
         .push(
             widget::row::with_capacity(2)
                 .spacing(cosmic::theme::spacing().space_s)
-                .push(widget::button::suggested("By solar period").on_press(Message::ModeChosen(AssignmentMode::SolarPeriod)))
-                .push(widget::button::suggested("By specific time").on_press(Message::ModeChosen(AssignmentMode::SpecificTime))),
+                .push(widget::button::suggested(tr("By parts of the day")).on_press(Message::ModeChosen(AssignmentMode::SolarBlocks)))
+                .push(widget::button::standard(tr("By solar period")).on_press(Message::ModeChosen(AssignmentMode::SolarPeriod)))
+                .push(widget::button::standard(tr("By specific time")).on_press(Message::ModeChosen(AssignmentMode::SpecificTime))),
         )
-        .push(widget::button::standard("Cancel").on_press(Message::Cancelled))
+        .push(widget::button::standard(tr("Cancel")).on_press(Message::Cancelled))
         .into()
 }
 
 fn configuration_view(state: &State, mode: AssignmentMode) -> Element<'_, Message> {
+    if mode == AssignmentMode::SolarBlocks {
+        return blocks_view(state);
+    }
+    let mut layout = widget::column::with_capacity(8).spacing(cosmic::theme::spacing().space_m);
+    layout = layout.push(widget::text::title3(match mode {
+        AssignmentMode::SolarPeriod => tr("Assign each image to a solar period"),
+        _ => tr("Assign each image a time of day"),
+    }));
     let mut rows_col = widget::column::with_capacity(state.rows.len()).spacing(cosmic::theme::spacing().space_xs);
     for (index, row) in state.rows.iter().enumerate() {
         rows_col = rows_col.push(row_view(row, index, mode));
     }
-
-    let mut layout = widget::column::with_capacity(6).spacing(cosmic::theme::spacing().space_m);
-    layout = layout.push(widget::text::title3(match mode {
-        AssignmentMode::SolarPeriod => "Assign each image to a solar period",
-        AssignmentMode::SpecificTime => "Assign each image a time of day",
-    }));
+    layout = layout.push(convert_hint_view(state));
     layout = layout.push(rows_col);
+    for field in pack_fields(state) {
+        layout = layout.push(field);
+    }
+    layout.push(footer_view(state, mode)).into()
+}
+
+/// The pack name and author inputs, each label and input on its own line.
+fn pack_fields(state: &State) -> [Element<'_, Message>; 4] {
     // Spec 012 FR-015 (US4): the pack's display name — shown throughout the GUI in
     // place of the folder name, never renaming the folder itself. Placeholder mirrors
     // the author field's own "leave blank for the default" pattern, with the actual
     // folder name as the concrete example rather than a generic placeholder string,
     // since that default is different for every pack.
     let folder_name = folder_display_name(&state.source_dir);
-    layout = layout.push(widget::text::body(format!("Pack name (leave blank for \"{folder_name}\")")));
-    layout = layout.push(widget::text_input::text_input(folder_name, &state.name).on_input(Message::NameChanged));
-    layout = layout.push(widget::text::body("Author (leave blank for \"Artist Unknown\")"));
-    layout = layout.push(widget::text_input::text_input("Artist Unknown", &state.author).on_input(Message::AuthorChanged));
+    [
+        widget::text::body(trf("Pack name (leave blank for \"{name}\")", &[("name", &folder_name)])).into(),
+        widget::text_input::text_input(folder_name, &state.name).on_input(Message::NameChanged).into(),
+        widget::text::body(tr("Author (leave blank for \"Artist Unknown\")")).into(),
+        widget::text_input::text_input("Artist Unknown", &state.author).on_input(Message::AuthorChanged).into(),
+    ]
+}
 
+/// Conflict/generate errors and the Cancel/Generate buttons.
+fn footer_view(state: &State, mode: AssignmentMode) -> Element<'_, Message> {
+    let spacing = cosmic::theme::spacing();
+    let mut col = widget::column::with_capacity(3).spacing(spacing.space_s);
     if let Some(reason) = &state.conflict {
-        layout = layout.push(widget::text::body(reason.clone()));
+        col = col.push(widget::text::body(reason.clone()));
     }
     if let Some(reason) = &state.generate_error {
-        layout = layout.push(widget::text::body(reason.clone()));
+        col = col.push(widget::text::body(reason.clone()));
     }
 
     let can_generate = state.conflict.is_none() && all_assigned(&state.rows, mode);
-    let mut generate_button = widget::button::suggested("Generate");
+    let mut generate_button = widget::button::suggested(tr("Generate"));
     if can_generate {
         generate_button = generate_button.on_press(Message::GenerateRequested);
     }
-
-    layout = layout.push(
+    col.push(
         widget::row::with_capacity(2)
-            .spacing(cosmic::theme::spacing().space_s)
-            .push(widget::button::standard("Cancel").on_press(Message::Cancelled))
+            .spacing(spacing.space_s)
+            .push(widget::button::standard(tr("Cancel")).on_press(Message::Cancelled))
             .push(generate_button),
+    )
+    .into()
+}
+
+/// Offers converting an event/clock schedule into solar blocks.
+fn convert_hint_view(state: &State) -> Element<'_, Message> {
+    let any_assigned = state.rows.iter().any(|r| r.solar.is_some() || r.time.is_some());
+    let mut row = widget::row::with_capacity(2).spacing(cosmic::theme::spacing().space_s).align_y(cosmic::iced::Alignment::Center);
+    if state.location.is_some() {
+        row = row.push(widget::text::caption(tr(
+            "Convert to parts of the day: each image goes into the block its current time falls in, and keeps following the sun from then on.",
+        )));
+        let mut button = widget::button::standard(tr("Convert to parts of the day"));
+        if any_assigned {
+            button = button.on_press(Message::ConvertToBlocks);
+        }
+        row = row.push(button);
+    } else {
+        row = row.push(widget::text::caption(tr("Set a location to convert this pack to parts of the day.")));
+    }
+    row.into()
+}
+
+fn format_hm(at: DateTime<Local>) -> String {
+    at.format("%H:%M").to_string()
+}
+
+fn span_text(start: DateTime<Local>, end: DateTime<Local>) -> String {
+    format!("{} \u{2013} {}", format_hm(start), format_hm(end))
+}
+
+/// The block selector entries: the parts of the day, then "Not used".
+fn block_choices() -> Vec<String> {
+    SolarPeriod::ALL.into_iter().map(period_label).chain(std::iter::once(tr("Not used"))).collect()
+}
+
+fn block_from_choice(index: usize) -> Option<SolarPeriod> {
+    SolarPeriod::ALL.get(index).copied()
+}
+
+fn accent_border(active: bool, width: f32) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |theme| {
+        let cosmic = theme.cosmic();
+        let color: cosmic::iced::Color = if active { cosmic.accent_color().into() } else { cosmic::iced::Color::TRANSPARENT };
+        cosmic::iced::widget::container::Style {
+            border: cosmic::iced::Border { color, width, radius: cosmic.radius_s().into() },
+            ..Default::default()
+        }
+    })
+}
+
+/// An empty drop slot: always outlined, highlighted while a drag hovers it.
+fn drop_slot_style(active: bool) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |theme| {
+        let cosmic = theme.cosmic();
+        let (color, background): (cosmic::iced::Color, Option<cosmic::iced::Background>) = if active {
+            let mut tint: cosmic::iced::Color = cosmic.accent_color().into();
+            tint.a = 0.15;
+            (cosmic.accent_color().into(), Some(cosmic::iced::Background::Color(tint)))
+        } else {
+            (cosmic.bg_divider().into(), None)
+        };
+        cosmic::iced::widget::container::Style {
+            border: cosmic::iced::Border { color, width: 2.0, radius: cosmic.radius_s().into() },
+            background,
+            ..Default::default()
+        }
+    })
+}
+
+fn insertion_bar(active: bool) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |theme| {
+        let color: cosmic::iced::Color =
+            if active { theme.cosmic().accent_color().into() } else { cosmic::iced::Color::TRANSPARENT };
+        cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(color)),
+            ..Default::default()
+        }
+    })
+}
+
+/// A large "+" slot that drops the dragged image at the end of `block`.
+fn drop_slot<'a>(state: &State, block: Option<SolarPeriod>, index: usize, width: Length, height: f32) -> Element<'a, Message> {
+    let target = DropTarget { block, index };
+    let active = state.dragging.is_some() && state.drop_target == Some(target);
+    let slot = widget::container(widget::icon::from_name("list-add-symbolic").size(32))
+        .width(width)
+        .height(height)
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .align_y(cosmic::iced::alignment::Vertical::Center)
+        .class(drop_slot_style(active));
+    widget::mouse_area(slot).on_enter(Message::DragEntered(target)).on_exit(Message::DragLeft(target)).into()
+}
+
+/// Width of an image card in a block; the "+" slot matches it.
+const CARD_WIDTH: f32 = 140.0;
+/// Height of the "+" slot inside a block — about one image card.
+const BLOCK_SLOT_HEIGHT: f32 = 120.0;
+/// Height of the "+" slot under the "Not used" list.
+const UNUSED_SLOT_HEIGHT: f32 = 64.0;
+
+/// The solar blocks editor: the parts of the day on the left (3/4 of the width), the
+/// pack's name, author and unused images on the right (1/4). Each side scrolls on its
+/// own, so both a block and the unused list stay in view while dragging between them.
+fn blocks_view<'a>(state: &'a State) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let schedule = preview_schedule(state);
+
+    let mut header = widget::column::with_capacity(3)
+        .spacing(spacing.space_xs)
+        .push(widget::text::title3(tr("Drag images into the parts of the day")))
+        .push(widget::text::caption(tr(
+            "Each part of the day is split evenly between its images, in order. Empty parts keep showing the previous image.",
+        )));
+    if state.location.is_some() {
+        header = header.push(
+            widget::row::with_capacity(4)
+                .spacing(spacing.space_xs)
+                .align_y(cosmic::iced::Alignment::Center)
+                .push(widget::button::standard("\u{2190}").on_press(Message::PreviewDayShifted(-1)))
+                .push(widget::text::body(trf("Times for {date}", &[("date", &state.preview_date.format("%Y-%m-%d").to_string())])))
+                .push(widget::button::standard("\u{2192}").on_press(Message::PreviewDayShifted(1)))
+                .push(widget::button::text(tr("Today")).on_press(Message::PreviewDayShifted(0))),
+        );
+    } else {
+        header = header.push(widget::text::caption(tr("Set a location on the Location page to see the computed times.")));
+    }
+
+    let mut blocks = widget::column::with_capacity(SolarPeriod::COUNT).spacing(spacing.space_s);
+    for period in SolarPeriod::ALL {
+        blocks = blocks.push(block_card(state, period, schedule.as_ref()));
+    }
+
+    let mut side = widget::column::with_capacity(6).spacing(spacing.space_xs);
+    for field in pack_fields(state) {
+        side = side.push(field);
+    }
+    side = side.push(widget::Space::new().height(spacing.space_xs)).push(unused_view(state));
+
+    let pane = |content: Element<'a, Message>, portion: u16| {
+        widget::scrollable(content)
+            .spacing(spacing.space_xxs)
+            .on_scroll(|_| Message::DragScrolled)
+            .width(Length::FillPortion(portion))
+            .height(Length::Fill)
+    };
+    let panes = widget::row::with_capacity(2)
+        .spacing(spacing.space_m)
+        .height(Length::Fill)
+        .push(pane(blocks.into(), 3))
+        .push(pane(side.into(), 1));
+
+    widget::column::with_capacity(3)
+        .spacing(spacing.space_s)
+        .height(Length::Fill)
+        .push(header)
+        .push(panes)
+        .push(footer_view(state, AssignmentMode::SolarBlocks))
+        .into()
+}
+
+fn block_card<'a>(state: &'a State, period: SolarPeriod, schedule: Option<&ResolvedSchedule>) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let resolved = schedule.map(|s| s.block(period));
+    let block = Some(period);
+    let members: Vec<&ImageRow> = state.rows.iter().filter(|r| r.period == block).collect();
+
+    let mut header = widget::row::with_capacity(2).spacing(spacing.space_s).align_y(cosmic::iced::Alignment::Center);
+    header = header.push(widget::text::heading(period_label(period)));
+    if let Some(rb) = resolved {
+        header = header.push(widget::text::caption(if rb.is_degenerate() {
+            tr("doesn't occur on this date")
+        } else {
+            span_text(rb.start, rb.end)
+        }));
+    }
+
+    let mut items: Vec<Element<'a, Message>> = Vec::with_capacity(members.len() + 1);
+    for (index, row) in members.iter().enumerate() {
+        let interval = resolved
+            .and_then(|rb| rb.images.iter().find(|img| img.id.as_str() == row.file_name))
+            .map(|img| span_text(img.start, img.active_until));
+        items.push(image_card(state, row, block, index, members.len(), interval));
+    }
+    items.push(drop_slot(state, block, members.len(), Length::Fixed(CARD_WIDTH), BLOCK_SLOT_HEIGHT));
+
+    let mut body = widget::column::with_capacity(3).spacing(spacing.space_xs).push(header);
+    match resolved {
+        Some(rb) if rb.is_degenerate() && !members.is_empty() => {
+            body = body.push(widget::text::caption(tr("This part of the day doesn't happen on this date, so its images are skipped.")));
+        }
+        Some(rb) if members.is_empty() => {
+            if let Some(inherited) = &rb.inherited {
+                body = body.push(widget::text::caption(trf("Empty — keeps showing {image}", &[("image", inherited.as_str())])));
+            }
+        }
+        _ => {}
+    }
+    body = body.push(widget::flex_row(items).row_spacing(spacing.space_xs).column_spacing(spacing.space_xs));
+
+    widget::container(body).padding(spacing.space_s).width(Length::Fill).class(cosmic::theme::Container::Card).into()
+}
+
+/// Shortens a file name to `max` characters with a trailing ellipsis.
+fn short_name(name: &str, max: usize) -> String {
+    if name.chars().count() > max {
+        name.chars().take(max - 1).chain(std::iter::once('\u{2026}')).collect()
+    } else {
+        name.to_string()
+    }
+}
+
+fn block_chooser<'a>(row: &ImageRow, block: Option<SolarPeriod>) -> Element<'a, Message> {
+    let selected = Some(block.map_or(SolarPeriod::COUNT, SolarPeriod::index));
+    let file_name = row.file_name.clone();
+    widget::dropdown(block_choices(), selected, move |i| Message::BlockSelected(file_name.clone(), block_from_choice(i))).into()
+}
+
+/// A draggable thumbnail that also marks the drop position in front of it.
+fn drag_handle<'a>(state: &State, row: &ImageRow, target: DropTarget, width: f32, height: f32) -> Element<'a, Message> {
+    let is_dragged = state.dragging.as_deref() == Some(row.file_name.as_str());
+    let thumb = widget::container(crate::thumbnail::view(&row.thumbnail_path, width, height))
+        .padding(2)
+        .class(accent_border(is_dragged, 2.0));
+    widget::mouse_area(thumb)
+        .on_press(Message::DragStarted(row.file_name.clone()))
+        .on_enter(Message::DragEntered(target))
+        .on_exit(Message::DragLeft(target))
+        .interaction(cosmic::iced::mouse::Interaction::Grab)
+        .into()
+}
+
+fn image_card<'a>(
+    state: &'a State,
+    row: &'a ImageRow,
+    block: Option<SolarPeriod>,
+    index: usize,
+    count: usize,
+    interval: Option<String>,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let target = DropTarget { block, index };
+    let is_target = state.dragging.is_some() && state.drop_target == Some(target);
+
+    let mut earlier = widget::button::icon(widget::icon::from_name("go-previous-symbolic")).extra_small();
+    if index > 0 {
+        earlier = earlier.on_press(Message::MoveWithinBlock(row.file_name.clone(), -1));
+    }
+    let mut later = widget::button::icon(widget::icon::from_name("go-next-symbolic")).extra_small();
+    if index + 1 < count {
+        later = later.on_press(Message::MoveWithinBlock(row.file_name.clone(), 1));
+    }
+
+    let mut card = widget::column::with_capacity(4)
+        .spacing(2)
+        .width(Length::Fixed(CARD_WIDTH))
+        .push(drag_handle(state, row, target, 96.0, 64.0))
+        .push(widget::text::caption(short_name(&row.file_name, 16)));
+    if let Some(interval) = interval {
+        card = card.push(widget::text::caption(interval));
+    }
+    card = card.push(
+        widget::row::with_capacity(3)
+            .spacing(2)
+            .align_y(cosmic::iced::Alignment::Center)
+            .push(earlier)
+            .push(later)
+            .push(block_chooser(row, block)),
     );
 
-    layout.into()
+    widget::row::with_capacity(2)
+        .spacing(spacing.space_xxs)
+        .push(widget::container(widget::Space::new().width(4).height(64)).class(insertion_bar(is_target)))
+        .push(card)
+        .into()
+}
+
+/// The images left out of the pack, one per line, with a "+" slot to drop more.
+fn unused_view(state: &State) -> Element<'_, Message> {
+    let spacing = cosmic::theme::spacing();
+    let members: Vec<&ImageRow> = state.rows.iter().filter(|r| r.period.is_none()).collect();
+    let mut col = widget::column::with_capacity(members.len() + 3)
+        .spacing(spacing.space_xs)
+        .push(widget::text::heading(tr("Not used")))
+        .push(widget::text::caption(tr("Images here are left out of the pack.")));
+    for (index, row) in members.into_iter().enumerate() {
+        let target = DropTarget { block: None, index };
+        let is_target = state.dragging.is_some() && state.drop_target == Some(target);
+        let line = widget::row::with_capacity(2)
+            .spacing(spacing.space_xs)
+            .align_y(cosmic::iced::Alignment::Center)
+            .push(drag_handle(state, row, target, 64.0, 42.0))
+            .push(
+                widget::column::with_capacity(2)
+                    .spacing(2)
+                    .width(Length::Fill)
+                    .push(widget::text::caption(short_name(&row.file_name, 22)))
+                    .push(block_chooser(row, None)),
+            );
+        col = col
+            .push(widget::container(widget::Space::new().width(Length::Fill).height(3)).class(insertion_bar(is_target)))
+            .push(line);
+    }
+    let end = state.rows.iter().filter(|r| r.period.is_none()).count();
+    col.push(drop_slot(state, None, end, Length::Fill, UNUSED_SLOT_HEIGHT)).into()
 }
 
 fn row_view(row: &ImageRow, index: usize, mode: AssignmentMode) -> Element<'_, Message> {
-    let thumbnail = widget::image(row.thumbnail_path.clone()).width(64).height(64);
+    let thumbnail = crate::thumbnail::view(&row.thumbnail_path, 64, 64);
     let control = match mode {
         AssignmentMode::SolarPeriod => solar_control(row.solar, index),
         AssignmentMode::SpecificTime => time_control(row.time, index),
+        AssignmentMode::SolarBlocks => widget::Space::new().into(),
     };
     widget::row::with_capacity(3)
         .spacing(cosmic::theme::spacing().space_s)
@@ -1212,8 +1817,8 @@ fn solar_control<'a>(assignment: Option<SolarAssignment>, index: usize) -> Eleme
     let sign_button =
         widget::button::standard(if negative { "\u{2212}" } else { "+" }).on_press(Message::SolarOffsetSignToggled(index));
     let hours_spin = widget::spin_button::spin_button(
-        format!("{hours}h"),
-        format!("offset hours, row {index}"),
+        format!("{hours}{}", tr("h")),
+        trf("offset hours, row {row}", &[("row", &index.to_string())]),
         hours,
         1,
         0,
@@ -1221,8 +1826,8 @@ fn solar_control<'a>(assignment: Option<SolarAssignment>, index: usize) -> Eleme
         move |v| Message::SolarOffsetHoursChanged(index, v),
     );
     let minutes_spin = widget::spin_button::spin_button(
-        format!("{minutes}m"),
-        format!("offset minutes, row {index}"),
+        format!("{minutes}{}", tr("m")),
+        trf("offset minutes, row {row}", &[("row", &index.to_string())]),
         minutes,
         1,
         0,
@@ -1243,11 +1848,11 @@ fn solar_control<'a>(assignment: Option<SolarAssignment>, index: usize) -> Eleme
 fn time_control<'a>(time: Option<NaiveTime>, index: usize) -> Element<'a, Message> {
     let hour = time.map_or(0, |t| t.hour());
     let minute = time.map_or(0, |t| t.minute());
-    let hour_spin = widget::spin_button::spin_button(format!("{hour:02}"), format!("hour, row {index}"), hour, 1, 0, 23, move |v| {
+    let hour_spin = widget::spin_button::spin_button(format!("{hour:02}"), trf("hour, row {row}", &[("row", &index.to_string())]), hour, 1, 0, 23, move |v| {
         Message::TimeHourChanged(index, v)
     });
     let minute_spin =
-        widget::spin_button::spin_button(format!("{minute:02}"), format!("minute, row {index}"), minute, 1, 0, 59, move |v| {
+        widget::spin_button::spin_button(format!("{minute:02}"), trf("minute, row {row}", &[("row", &index.to_string())]), minute, 1, 0, 59, move |v| {
             Message::TimeMinuteChanged(index, v)
         });
     widget::row::with_capacity(2)
@@ -1269,19 +1874,22 @@ pub fn placement_dialog(state: &State) -> Option<Element<'_, Message>> {
         // generic "already exists" body, mirroring how `pending_placement`'s dialog
         // just below already prefers `move_error` when present.
         let (title, body) = match &state.move_error {
-            Some(reason) => ("Can't use that pack name", reason.clone()),
+            Some(reason) => (tr("Can't use that pack name"), reason.clone()),
             None => (
-                "A pack with that name already exists",
-                format!("\"{}\" already exists at the standard pack location. Choose a different name.", pending.suggested_name),
+                tr("A pack with that name already exists"),
+                trf(
+                    "\"{name}\" already exists at the standard pack location. Choose a different name.",
+                    &[("name", &pending.suggested_name)],
+                ),
             ),
         };
         return Some(
             widget::dialog()
                 .title(title)
                 .body(body)
-                .control(widget::text_input::text_input("pack name", &pending.suggested_name).on_input(Message::CollisionNameChanged))
-                .primary_action(widget::button::suggested("Move").on_press(Message::CollisionConfirmed))
-                .secondary_action(widget::button::standard("Cancel").on_press(Message::CollisionCancelled))
+                .control(widget::text_input::text_input(tr("pack name"), &pending.suggested_name).on_input(Message::CollisionNameChanged))
+                .primary_action(widget::button::suggested(tr("Move")).on_press(Message::CollisionConfirmed))
+                .secondary_action(widget::button::standard(tr("Cancel")).on_press(Message::CollisionCancelled))
                 .into(),
         );
     }
@@ -1289,13 +1897,13 @@ pub fn placement_dialog(state: &State) -> Option<Element<'_, Message>> {
         let body = state
             .move_error
             .clone()
-            .unwrap_or_else(|| "Move this pack to the standard pack location, or keep it where it is?".to_string());
+            .unwrap_or_else(|| tr("Move this pack to the standard pack location, or keep it where it is?"));
         return Some(
             widget::dialog()
-                .title("Pack generated")
+                .title(tr("Pack generated"))
                 .body(body)
-                .primary_action(widget::button::suggested("Move").on_press(Message::MoveRequested))
-                .secondary_action(widget::button::standard("Keep it here").on_press(Message::KeepRequested))
+                .primary_action(widget::button::suggested(tr("Move")).on_press(Message::MoveRequested))
+                .secondary_action(widget::button::standard(tr("Keep it here")).on_press(Message::KeepRequested))
                 .into(),
         );
     }
@@ -2324,5 +2932,200 @@ mod tests {
         assert!(assignment.offset_negative);
         assert_eq!(assignment.offset_hours, 12, "hours must clamp to the same ±12h cap the add flow uses");
         assert_eq!(assignment.offset_minutes, 0, "minutes must be forced to 0 once hours reaches the cap, same as the add flow");
+    }
+
+    // --- Solar blocks editor ---
+
+    fn names(rows: &[ImageRow]) -> Vec<(&str, Option<SolarPeriod>)> {
+        rows.iter().map(|r| (r.file_name.as_str(), r.period)).collect()
+    }
+
+    fn blocks_rows() -> Vec<ImageRow> {
+        let mut rows: Vec<ImageRow> = ["a", "b", "c", "d"].iter().map(|n| image_row(n)).collect();
+        rows[0].period = Some(SolarPeriod::Morning);
+        rows[1].period = Some(SolarPeriod::Morning);
+        rows[2].period = Some(SolarPeriod::Night);
+        rows
+    }
+
+    #[test]
+    fn place_row_inserts_before_the_indexed_block_member() {
+        let mut rows = blocks_rows();
+        place_row(&mut rows, "d", Some(SolarPeriod::Morning), 0);
+        assert_eq!(
+            names(&rows),
+            vec![("d", Some(SolarPeriod::Morning)), ("a", Some(SolarPeriod::Morning)), ("b", Some(SolarPeriod::Morning)), ("c", Some(SolarPeriod::Night))]
+        );
+    }
+
+    #[test]
+    fn place_row_onto_own_position_is_a_no_op() {
+        let mut rows = blocks_rows();
+        let before = rows.clone();
+        place_row(&mut rows, "a", Some(SolarPeriod::Morning), 0);
+        assert_eq!(rows, before);
+        place_row(&mut rows, "a", Some(SolarPeriod::Morning), 1);
+        assert_eq!(rows, before);
+    }
+
+    #[test]
+    fn place_row_into_an_empty_block_keeps_block_order() {
+        let mut rows = blocks_rows();
+        place_row(&mut rows, "a", Some(SolarPeriod::Evening), 0);
+        assert_eq!(
+            names(&rows),
+            vec![("b", Some(SolarPeriod::Morning)), ("a", Some(SolarPeriod::Evening)), ("c", Some(SolarPeriod::Night)), ("d", None)]
+        );
+        place_row(&mut rows, "b", None, usize::MAX);
+        assert_eq!(names(&rows).last(), Some(&("b", None)));
+    }
+
+    #[test]
+    fn moving_inside_a_block_only_changes_that_blocks_times() {
+        let location = Location::new(48.85, 2.35).unwrap();
+        let date = NaiveDate::from_ymd_opt(2024, 3, 20).unwrap();
+        let mut state = open_test_state(&["a.png", "b.png", "c.png"]);
+        set_mode(&mut state, AssignmentMode::SolarBlocks);
+        select_block(&mut state, "a.png", Some(SolarPeriod::Night));
+        select_block(&mut state, "b.png", Some(SolarPeriod::Morning));
+        select_block(&mut state, "c.png", Some(SolarPeriod::Morning));
+        state.location = Some(location);
+        state.preview_date = date;
+        let before = preview_schedule(&state).unwrap();
+
+        move_within_block(&mut state, "c.png", -1);
+        assert_eq!(names(&state.rows)[0].0, "c.png");
+        let after = preview_schedule(&state).unwrap();
+        assert_eq!(before.block(SolarPeriod::Night), after.block(SolarPeriod::Night));
+        assert_ne!(before.block(SolarPeriod::Morning), after.block(SolarPeriod::Morning));
+
+        move_within_block(&mut state, "c.png", 1);
+        assert_eq!(preview_schedule(&state).unwrap(), before);
+    }
+
+    #[test]
+    fn drag_and_drop_places_on_the_hovered_target_and_cancels_elsewhere() {
+        let mut state = open_test_state(&["a.png", "b.png"]);
+        set_mode(&mut state, AssignmentMode::SolarBlocks);
+        start_drag(&mut state, "a.png".into());
+        let target = DropTarget { block: Some(SolarPeriod::Day), index: 0 };
+        drag_entered(&mut state, target);
+        release_drag(&mut state);
+        assert_eq!(state.rows[0].period, Some(SolarPeriod::Day));
+        assert!(state.dragging.is_none());
+
+        start_drag(&mut state, "b.png".into());
+        drag_entered(&mut state, target);
+        drag_left(&mut state, target);
+        release_drag(&mut state);
+        assert_eq!(state.rows.iter().find(|r| r.file_name == "b.png").unwrap().period, None);
+
+        // Scrolling moves the content under a still cursor, so the hovered slot is stale.
+        start_drag(&mut state, "b.png".into());
+        drag_entered(&mut state, target);
+        drag_scrolled(&mut state);
+        release_drag(&mut state);
+        assert_eq!(state.rows.iter().find(|r| r.file_name == "b.png").unwrap().period, None);
+    }
+
+    #[test]
+    fn blocks_mode_needs_one_placed_image_and_skips_the_tray() {
+        let mut rows = blocks_rows();
+        assert!(all_assigned(&rows, AssignmentMode::SolarBlocks));
+        let draft = build_draft(&rows, AssignmentMode::SolarBlocks, "", "F", "", None);
+        let anchors: Vec<_> = draft.images.iter().map(|i| (i.file.as_str(), i.anchor)).collect();
+        assert_eq!(
+            anchors,
+            vec![
+                ("a", TimeAnchor::Period { period: SolarPeriod::Morning, slot: 0, of: 2 }),
+                ("b", TimeAnchor::Period { period: SolarPeriod::Morning, slot: 1, of: 2 }),
+                ("c", TimeAnchor::Period { period: SolarPeriod::Night, slot: 0, of: 1 }),
+            ]
+        );
+        for row in &mut rows {
+            row.period = None;
+        }
+        assert!(!all_assigned(&rows, AssignmentMode::SolarBlocks));
+    }
+
+    #[test]
+    fn converting_keeps_todays_order_and_classifies_by_time() {
+        use chrono::{Offset, TimeZone};
+        let date = NaiveDate::from_ymd_opt(2024, 3, 20).unwrap();
+        // A longitude matching the test machine's own UTC offset, so local clock times
+        // line up with the sun the same way everywhere this test runs.
+        let offset = Local.from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap()).unwrap().offset().fix().local_minus_utc();
+        let location = Location::new(45.0, (f64::from(offset) / 240.0).clamp(-180.0, 180.0)).unwrap();
+        let mut rows: Vec<ImageRow> = ["late", "noon", "early", "dawn", "unset"].iter().map(|n| image_row(n)).collect();
+        rows[0].time = NaiveTime::from_hms_opt(23, 59, 0);
+        rows[1].time = NaiveTime::from_hms_opt(12, 30, 0);
+        rows[2].time = NaiveTime::from_hms_opt(1, 0, 0);
+        rows[3].solar = Some(solar(SolarEventKind::Sunrise));
+
+        convert_rows_to_blocks(&mut rows, &location, date);
+
+        assert_eq!(
+            names(&rows),
+            vec![
+                ("dawn", Some(SolarPeriod::Morning)),
+                ("noon", Some(SolarPeriod::Day)),
+                // The night runs past midnight: tonight's 23:59 comes before 01:00.
+                ("late", Some(SolarPeriod::Night)),
+                ("early", Some(SolarPeriod::Night)),
+                ("unset", None),
+            ]
+        );
+        assert!(rows.iter().all(|r| r.solar.is_none() && r.time.is_none()));
+    }
+
+    #[test]
+    fn converting_keeps_the_night_block_that_crosses_midnight_in_order() {
+        use chrono::{Offset, TimeZone};
+        let date = NaiveDate::from_ymd_opt(2024, 6, 21).unwrap();
+        // 30° west of the machine's own offset longitude: local clocks run 2 h ahead
+        // of the sun, so the short midsummer night is still well clear of midnight.
+        let offset = Local.from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap()).unwrap().offset().fix().local_minus_utc();
+        let location = Location::new(47.0, (f64::from(offset) / 240.0 - 30.0).clamp(-180.0, 180.0)).unwrap();
+        let boundaries = schedule_engine::PeriodBoundaries::compute(&location, date).unwrap();
+        let (dusk_start, dusk_end) = boundaries.span(SolarPeriod::Night);
+        let at = |d: NaiveDate, h, m| Local.from_local_datetime(&d.and_hms_opt(h, m, 0).unwrap()).unwrap();
+        assert!(dusk_start < at(date, 23, 50) && dusk_end > at(date + TimeDelta::days(1), 0, 10), "fixture assumption {dusk_start} {dusk_end}");
+
+        let mut rows: Vec<ImageRow> = ["after-midnight", "before-midnight"].iter().map(|n| image_row(n)).collect();
+        rows[0].time = NaiveTime::from_hms_opt(0, 10, 0);
+        rows[1].time = NaiveTime::from_hms_opt(23, 50, 0);
+
+        convert_rows_to_blocks(&mut rows, &location, date);
+
+        assert_eq!(
+            names(&rows),
+            vec![("before-midnight", Some(SolarPeriod::Night)), ("after-midnight", Some(SolarPeriod::Night))]
+        );
+    }
+
+    #[test]
+    fn a_blocks_pack_round_trips_through_generate_and_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.png", "b.png", "c.png", "d.png"] {
+            write_test_image(&dir.path().join(name));
+        }
+        let mut state = open(dir.path().to_path_buf());
+        set_mode(&mut state, AssignmentMode::SolarBlocks);
+        select_block(&mut state, "c.png", Some(SolarPeriod::Morning));
+        select_block(&mut state, "a.png", Some(SolarPeriod::Morning));
+        select_block(&mut state, "b.png", Some(SolarPeriod::Night));
+        let _ = generate(&mut state);
+        assert_eq!(state.generate_error, None);
+        let registry_dir = tempfile::tempdir().unwrap();
+        let mut registry = pack_loader::Registry::open_at(registry_dir.path()).unwrap();
+        assert!(confirm_keep(&mut state, &mut registry), "{:?}", state.move_error);
+
+        let source = PackSource::resolve(dir.path()).unwrap();
+        let edit = open_for_edit(dir.path().to_path_buf(), source).unwrap();
+        assert_eq!(edit.mode, Some(AssignmentMode::SolarBlocks));
+        assert_eq!(
+            names(&edit.rows),
+            vec![("c.png", Some(SolarPeriod::Morning)), ("a.png", Some(SolarPeriod::Morning)), ("b.png", Some(SolarPeriod::Night)), ("d.png", None)]
+        );
     }
 }

@@ -50,7 +50,10 @@ pub fn maybe_register(starter_pack_path: &Path, pack_registry: &mut Registry, re
     if pack_registry.register_with_origin(source.clone(), PackOrigin::Package).is_err() {
         return false;
     }
-    if renderer_config.same_pack_everywhere.is_none() && renderer_config.overrides.is_empty() {
+    if renderer_config.same_pack_everywhere.is_none()
+        && renderer_config.overrides.is_empty()
+        && renderer_config.monitors.values().all(|m| m.pack.is_none())
+    {
         // Only ever sets the default when nothing else has been configured — never
         // overrides a user's own explicit assignment made before or after install.
         renderer_config.same_pack_everywhere = Some(source);

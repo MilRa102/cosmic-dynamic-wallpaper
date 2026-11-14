@@ -102,6 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut daemon = WallpaperDaemon::new(&globals, &qh, pack_registry, renderer_config, location)?;
     daemon.set_loop_handle(event_loop.handle());
     daemon.set_connection(daemon_conn);
+    daemon.set_renderer_config_store(renderer_config_store.clone());
 
     // Live config-watch: a `RendererConfig`/`LocationConfigEntry` change written by
     // `wallpaperctl` is picked up without restarting this daemon — each watch feeds

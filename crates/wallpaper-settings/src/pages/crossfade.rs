@@ -8,6 +8,8 @@ use cosmic::widget;
 use cosmic::Element;
 use wallpaper_ipc::RendererConfig;
 
+use crate::i18n::{tr, trf};
+
 /// T023: writes `RendererConfig.crossfade_duration_secs` — pure, independent of any
 /// config I/O.
 pub fn set_duration(config: &mut RendererConfig, seconds: u32) {
@@ -25,8 +27,8 @@ pub struct State {
 
 pub fn view(state: &State) -> Element<'_, Message> {
     let seconds = state.current_config.crossfade_duration_secs;
-    let section = widget::settings::section().title("Crossfade").add(widget::settings::item(
-        format!("Duration: {seconds}s"),
+    let section = widget::settings::section().title(tr("Crossfade")).add(widget::settings::item(
+        trf("Duration: {seconds}s", &[("seconds", &seconds.to_string())]),
         widget::slider(5.0f32..=120.0, seconds as f32, Message::DurationChanged).step(5.0f32),
     ));
     widget::scrollable(widget::column::with_capacity(1).push(section)).into()

@@ -13,3 +13,10 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "GPL-3.0-or-later"
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = true
+debug = false

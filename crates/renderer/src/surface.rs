@@ -49,6 +49,7 @@ use smithay_client_toolkit::{
     },
     reexports::protocols::wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     reexports::protocols::wp::viewporter::client::{wp_viewport, wp_viewporter},
+    reexports::protocols_wlr::output_management::v1::client::{zwlr_output_head_v1, zwlr_output_manager_v1, zwlr_output_mode_v1},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::{
@@ -70,7 +71,7 @@ use crate::crossfade::{CrossfadePipeline, CrossfadeTransition};
 use crate::dbus_types::QueryResponse;
 use crate::error::RendererError;
 use crate::gpu::GpuContext;
-use crate::output::{effective_pack, resolve_assignment, OutputId, RendererConfig};
+use crate::output::{dedupe_monitor_keys, effective_pack, monitor_key, resolve_monitor_assignment, ConnectedMonitor, OutputId, RendererConfig};
 use crate::scheduler_bridge;
 use crate::texture::GpuTexture;
 
@@ -171,6 +172,11 @@ impl TextureCache {
 /// needed to decide what to draw on its next frame.
 struct WallpaperOutput {
     id: OutputId,
+    /// The physical monitor's stable identity ([`monitor_key`]) — what its pack
+    /// assignment is looked up by, so it follows the monitor across ports.
+    monitor_key: String,
+    /// Human-readable monitor name for the settings GUI.
+    label: String,
     wl_output: wl_output::WlOutput,
     layer: LayerSurface,
     viewport: wp_viewport::WpViewport,
@@ -210,6 +216,25 @@ struct WallpaperOutput {
     /// bounded, dedicated retry instead of depending entirely on unrelated events.
     /// Cleared as soon as a draw succeeds again.
     surface_recovery_retry_at: Option<Instant>,
+}
+
+/// What `zwlr_output_head_v1` told us about one head — the only source of the EDID
+/// serial number on COSMIC (`wl_output` carries make/model but no serial).
+#[derive(Debug, Default, Clone)]
+struct HeadInfo {
+    name: String,
+    make: String,
+    model: String,
+    serial: Option<String>,
+}
+
+fn monitor_identity(connector: &str, output_make: &str, output_model: &str, description: Option<&str>, head: Option<&HeadInfo>) -> (String, String) {
+    let make = head.map(|h| h.make.as_str()).filter(|s| !s.is_empty()).unwrap_or(output_make);
+    let model = head.map(|h| h.model.as_str()).filter(|s| !s.is_empty()).unwrap_or(output_model);
+    let key = monitor_key(make, model, head.and_then(|h| h.serial.as_deref()), connector);
+    let label = format!("{make} {model}").trim().to_string();
+    let label = if label.is_empty() { description.unwrap_or(connector).to_string() } else { label };
+    (key, label)
 }
 
 /// The `wallpaperd` application state — one instance drives every managed output plus
@@ -266,6 +291,16 @@ pub struct WallpaperDaemon {
     /// `dbus_service`'s module doc for why this is `Arc<Mutex<_>>` rather than
     /// `Rc<RefCell<_>>` despite the daemon staying single-threaded.
     dbus_state: std::sync::Arc<std::sync::Mutex<crate::dbus_service::DbusState>>,
+    /// `None` when the compositor doesn't offer `wlr-output-management` — monitors
+    /// are then identified by `wl_output` make/model (no serial).
+    output_manager: Option<zwlr_output_manager_v1::ZwlrOutputManagerV1>,
+    heads: Vec<(zwlr_output_head_v1::ZwlrOutputHeadV1, HeadInfo)>,
+    /// Set by the manager's first `done` — until then a missing head means "not
+    /// reported yet", not "no serial", so newly seen monitors aren't registered
+    /// under a provisional connector key.
+    heads_ready: bool,
+    /// Where newly connected monitors are registered ([`Self::set_renderer_config_store`]).
+    renderer_config_store: Option<cosmic_config::Config>,
 }
 
 impl WallpaperDaemon {
@@ -296,7 +331,19 @@ impl WallpaperDaemon {
                 }
             };
 
+        let output_manager: Option<zwlr_output_manager_v1::ZwlrOutputManagerV1> = match globals.bind(qh, 1..=4, ()) {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                tracing::warn!(reason = %e, "zwlr_output_manager_v1 unavailable — monitors are identified by connector name only");
+                None
+            }
+        };
+
         Ok(Self {
+            output_manager,
+            heads: Vec::new(),
+            heads_ready: false,
+            renderer_config_store: None,
             registry_state: RegistryState::new(globals),
             output_state: OutputState::new(globals, qh),
             compositor_state,
@@ -323,7 +370,8 @@ impl WallpaperDaemon {
     /// Create a managed background layer surface for `wl_output`.
     fn add_output(&mut self, wl_output: wl_output::WlOutput, info: OutputInfo) {
         let id = OutputId::new(info.name.clone().unwrap_or_else(|| format!("output-{}", info.id)));
-        tracing::info!(output = %id, "new output");
+        let (monitor_key, label) = self.identify(id.as_str(), &info);
+        tracing::info!(output = %id, monitor = %monitor_key, "new output");
 
         let wl_surface = self.compositor_state.create_surface(&self.qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -343,6 +391,8 @@ impl WallpaperDaemon {
 
         self.outputs.push(WallpaperOutput {
             id,
+            monitor_key,
+            label,
             wl_output,
             layer,
             viewport,
@@ -357,13 +407,80 @@ impl WallpaperDaemon {
             frame_callback_pending: false,
             surface_recovery_retry_at: None,
         });
+        self.sync_monitors();
     }
 
     fn remove_output(&mut self, wl_output: &wl_output::WlOutput) {
         if let Some(pos) = self.outputs.iter().position(|o| &o.wl_output == wl_output) {
             let removed = self.outputs.remove(pos);
             tracing::info!(output = %removed.id, "output removed");
+            self.sync_monitors();
         }
+    }
+
+    /// Store the handle newly connected monitors are registered through. Call once at
+    /// startup; without it monitors are still identified, just not persisted.
+    pub fn set_renderer_config_store(&mut self, store: cosmic_config::Config) {
+        self.renderer_config_store = Some(store);
+    }
+
+    /// `(monitor_key, label)` for the output on `connector`, from its
+    /// `wlr-output-management` head when known.
+    fn identify(&self, connector: &str, info: &OutputInfo) -> (String, String) {
+        let head = self.heads.iter().map(|(_, head)| head).find(|head| head.name == connector);
+        monitor_identity(connector, &info.make, &info.model, info.description.as_deref(), head)
+    }
+
+    /// Recompute every output's monitor identity (heads can arrive after the
+    /// `wl_output`), reload the pack of any output whose identity changed, register
+    /// newly seen monitors in the config, and refresh `ListMonitors`.
+    fn sync_monitors(&mut self) {
+        let mut identified: Vec<(usize, ConnectedMonitor)> = Vec::new();
+        for index in 0..self.outputs.len() {
+            let Some(info) = self.output_state.info(&self.outputs[index].wl_output) else { continue };
+            let connector = self.outputs[index].id.as_str().to_string();
+            let (key, label) = self.identify(&connector, &info);
+            identified.push((index, ConnectedMonitor { key, connector, label }));
+        }
+        let mut monitors: Vec<ConnectedMonitor> = identified.iter().map(|(_, m)| m.clone()).collect();
+        dedupe_monitor_keys(&mut monitors);
+
+        let mut changed = Vec::new();
+        for ((index, _), monitor) in identified.iter().zip(&monitors) {
+            let output = &mut self.outputs[*index];
+            output.label.clone_from(&monitor.label);
+            if output.monitor_key != monitor.key {
+                tracing::info!(output = %output.id, monitor = %monitor.key, "monitor identity resolved");
+                output.monitor_key.clone_from(&monitor.key);
+                changed.push(*index);
+            }
+        }
+        let identity_settled = self.output_manager.is_none() || self.heads_ready;
+        let connected = if identity_settled { monitors } else { Vec::new() };
+
+        if self.renderer_config.register_monitors(&connected) {
+            if let Some(store) = self.renderer_config_store.as_ref() {
+                if let Err(e) = RendererConfig::save_registered_monitors(store, &connected) {
+                    tracing::error!(error = %e, "failed to persist newly connected monitors");
+                }
+            }
+        }
+
+        let mut reevaluated = false;
+        for index in changed {
+            if self.outputs[index].size.is_some() {
+                self.load_pack_for(index);
+                let id = self.outputs[index].id.clone();
+                let _ = self.evaluate_and_draw(&id);
+                reevaluated = true;
+            }
+        }
+        if reevaluated {
+            self.reschedule_idle_timer();
+        }
+
+        let monitors = self.outputs.iter().map(|o| (o.monitor_key.clone(), o.id.as_str().to_string(), o.label.clone())).collect();
+        self.dbus_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_monitors(monitors);
     }
 
     /// Bridge a newly-configured layer surface's `wl_surface` to a `wgpu::Surface`,
@@ -413,7 +530,7 @@ impl WallpaperDaemon {
     /// cache — called on assignment change or first configure.
     fn load_pack_for(&mut self, index: usize) {
         let id = self.outputs[index].id.clone();
-        let assignment = resolve_assignment(&id, &self.renderer_config);
+        let assignment = resolve_monitor_assignment(&id, Some(&self.outputs[index].monitor_key), &self.renderer_config);
         let Some(source) = effective_pack(&assignment, &self.renderer_config) else {
             self.outputs[index].loaded_pack = None;
             self.outputs[index].textures.clear();
@@ -924,6 +1041,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn monitor_identity_falls_back_to_each_wl_output_field() {
+        let mut head = HeadInfo::default();
+        assert_eq!(monitor_identity("DP-1", "Dell", "P2419H", None, Some(&head)),
+            ("model-Dell-P2419H".into(), "Dell P2419H".into()));
+        head.make = "Other".into();
+        head.serial = Some("ABC123".into());
+        assert_eq!(monitor_identity("DP-1", "Dell", "P2419H", None, Some(&head)),
+            ("edid-Other-P2419H-ABC123".into(), "Other P2419H".into()));
+    }
+
+    #[test]
     fn clamp_reconfigure_size_rejects_zero_on_either_axis() {
         assert_eq!(clamp_reconfigure_size((0, 600)), (1, 600));
         assert_eq!(clamp_reconfigure_size((800, 0)), (800, 1));
@@ -1206,6 +1334,82 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WallpaperDaem
         let Some(index) = state.outputs.iter().position(|o| o.fractional_scale.as_ref() == Some(proxy)) else { return };
         state.outputs[index].preferred_scale = Some(scale);
         tracing::debug!(output = %state.outputs[index].id, scale_120ths = scale, "fractional scale preference changed");
+    }
+}
+
+impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for WallpaperDaemon {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_output_manager_v1::ZwlrOutputManagerV1,
+        event: zwlr_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_output_manager_v1::Event::Head { head } => state.heads.push((head, HeadInfo::default())),
+            zwlr_output_manager_v1::Event::Done { .. } => {
+                state.heads_ready = true;
+                state.sync_monitors();
+            }
+            zwlr_output_manager_v1::Event::Finished => {
+                state.output_manager = None;
+                state.heads.clear();
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(WallpaperDaemon, zwlr_output_manager_v1::ZwlrOutputManagerV1, [
+        zwlr_output_manager_v1::EVT_HEAD_OPCODE => (zwlr_output_head_v1::ZwlrOutputHeadV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for WallpaperDaemon {
+    fn event(
+        state: &mut Self,
+        proxy: &zwlr_output_head_v1::ZwlrOutputHeadV1,
+        event: zwlr_output_head_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_output_head_v1::Event::Finished = event {
+            state.heads.retain(|(head, _)| head != proxy);
+            if proxy.version() >= 3 {
+                proxy.release();
+            }
+            return;
+        }
+        let Some((_, info)) = state.heads.iter_mut().find(|(head, _)| head == proxy) else { return };
+        match event {
+            zwlr_output_head_v1::Event::Name { name } => info.name = name,
+            zwlr_output_head_v1::Event::Make { make } => info.make = make,
+            zwlr_output_head_v1::Event::Model { model } => info.model = model,
+            zwlr_output_head_v1::Event::SerialNumber { serial_number } => info.serial = Some(serial_number),
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(WallpaperDaemon, zwlr_output_head_v1::ZwlrOutputHeadV1, [
+        zwlr_output_head_v1::EVT_MODE_OPCODE => (zwlr_output_mode_v1::ZwlrOutputModeV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_output_mode_v1::ZwlrOutputModeV1, ()> for WallpaperDaemon {
+    fn event(
+        _: &mut Self,
+        proxy: &zwlr_output_mode_v1::ZwlrOutputModeV1,
+        event: zwlr_output_mode_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_output_mode_v1::Event::Finished = event {
+            if proxy.version() >= 3 {
+                proxy.release();
+            }
+        }
     }
 }
 

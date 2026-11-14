@@ -5,8 +5,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod app;
+mod i18n;
 mod pack_display;
 mod pages;
+mod thumbnail;
 
 fn main() {
     tracing_subscriber::fmt::init();
