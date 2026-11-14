@@ -109,6 +109,80 @@ impl fmt::Display for OutputId {
     }
 }
 
+/// The longest monitor key [`monitor_key`] produces.
+pub const MAX_MONITOR_KEY_BYTES: usize = 200;
+
+/// A stable identifier for a *physical monitor*, independent of the port it's plugged
+/// into, from the most specific EDID data available:
+/// 1. `edid-<make>-<model>-<serial>` — a real serial number (via `wlr-output-management`);
+/// 2. `model-<make>-<model>` — no usable serial, but the make/model are known;
+/// 3. `output-<connector>` — the output name, only when the EDID reports neither.
+///
+/// Every non `[A-Za-z0-9_-]` byte becomes `_`, so a key is always a valid
+/// [`OutputId::validated`] string as well (CLI/D-Bus safe).
+pub fn monitor_key(make: &str, model: &str, serial: Option<&str>, connector: &str) -> String {
+    let sanitize = |s: &str| -> String {
+        s.trim().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
+    };
+    let known = |s: &str| {
+        let s = s.trim();
+        !s.is_empty() && !s.eq_ignore_ascii_case("unknown")
+    };
+    let serial = serial.map(str::trim).filter(|s| is_real_serial(s));
+    let mut key = match serial {
+        Some(serial) => format!("edid-{}-{}-{}", sanitize(make), sanitize(model), sanitize(serial)),
+        None if known(make) || known(model) => format!("model-{}-{}", sanitize(make), sanitize(model)),
+        None => format!("output-{}", sanitize(connector)),
+    };
+    key.truncate(MAX_MONITOR_KEY_BYTES);
+    key
+}
+
+/// Rejects the placeholder serials many panels report instead of a real one —
+/// empty, "Unknown", a repeated character ("0000", "1111"), or 0x01010101.
+fn is_real_serial(serial: &str) -> bool {
+    let mut chars = serial.chars();
+    let Some(first) = chars.next() else { return false };
+    !serial.eq_ignore_ascii_case("unknown") && serial != "16843009" && !chars.all(|c| c == first)
+}
+
+/// Makes every key in `monitors` unique: monitors whose EDID data can't tell them
+/// apart (identical serial-less models, or the same placeholder serial) fall back to
+/// their output name, so they can still be configured separately.
+pub fn dedupe_monitor_keys(monitors: &mut [ConnectedMonitor]) {
+    let keys: Vec<String> = monitors.iter().map(|m| m.key.clone()).collect();
+    for monitor in monitors.iter_mut() {
+        if keys.iter().filter(|k| **k == monitor.key).count() > 1 {
+            monitor.key = monitor_key("", "", None, &monitor.connector);
+        }
+    }
+}
+
+/// The persisted per-monitor setting — survives the monitor being unplugged (it's
+/// then just "disabled": known, not connected) until the user forgets it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorConfig {
+    /// The pack shown on this monitor; `None` = the default pack
+    /// (`RendererConfig.same_pack_everywhere`).
+    pub pack: Option<PackSource>,
+    /// Human-readable name ("Dell U2720Q"), refreshed by the daemon on connect.
+    pub label: String,
+    /// The connector it was last seen on ("DP-3") — display only, never used to match.
+    pub last_connector: String,
+}
+
+/// A monitor the daemon currently drives, as it reports it (`ListMonitors`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedMonitor {
+    /// [`monitor_key`].
+    pub key: String,
+    /// The connector it's on right now.
+    pub connector: String,
+    /// Human-readable name.
+    pub label: String,
+}
+
 /// What one output should display — exactly one of, per output (data-model.md
 /// `OutputAssignment`, FR-005, FR-006).
 #[derive(Debug, Clone, PartialEq)]
@@ -147,11 +221,17 @@ pub struct RendererConfig {
     /// nothing until a user visits the GUI's Crossfade page or runs a future CLI
     /// equivalent.
     pub crossfade_duration_secs: u32,
+    /// Per-monitor settings keyed by [`monitor_key`] — the stable, port-independent
+    /// successor to `overrides`. An entry here is authoritative for its monitor
+    /// (`pack: None` = default pack); `overrides` only applies to monitors with no
+    /// entry yet. Absent on disk for configs written before this field existed,
+    /// which `cosmic-config`'s per-key fallback turns into an empty map.
+    pub monitors: HashMap<String, MonitorConfig>,
 }
 
 impl Default for RendererConfig {
     fn default() -> Self {
-        Self { same_pack_everywhere: None, overrides: HashMap::new(), crossfade_duration_secs: 45 }
+        Self { same_pack_everywhere: None, overrides: HashMap::new(), crossfade_duration_secs: 45, monitors: HashMap::new() }
     }
 }
 
@@ -236,6 +316,74 @@ impl RendererConfig {
         let _ = old.save(new_config);
         old
     }
+}
+
+impl RendererConfig {
+    /// Records newly connected monitors (and refreshes the label/connector of known
+    /// ones) — a reconnect finds its old entry and therefore its old pack. A new
+    /// monitor inherits a legacy `overrides` entry for its connector, if any, so
+    /// per-port setups keep working after upgrading. Returns whether anything changed.
+    pub fn register_monitors(&mut self, connected: &[ConnectedMonitor]) -> bool {
+        let mut changed = false;
+        for monitor in connected {
+            match self.monitors.get_mut(&monitor.key) {
+                Some(entry) => {
+                    if entry.label != monitor.label || entry.last_connector != monitor.connector {
+                        entry.label.clone_from(&monitor.label);
+                        entry.last_connector.clone_from(&monitor.connector);
+                        changed = true;
+                    }
+                }
+                None => {
+                    let pack = self.overrides.get(&monitor.connector).cloned();
+                    self.monitors.insert(
+                        monitor.key.clone(),
+                        MonitorConfig { pack, label: monitor.label.clone(), last_connector: monitor.connector.clone() },
+                    );
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Writes only the `monitors` key, after re-reading it from disk — so the daemon
+    /// registering a monitor never clobbers anything the GUI/CLI wrote meanwhile.
+    pub fn save_registered_monitors(config: &Config, connected: &[ConnectedMonitor]) -> Result<bool, cosmic_config::Error> {
+        let mut current = Self::load(config);
+        if !current.register_monitors(connected) {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        crate::ensure_config_dir_permissions_before_write(RENDERER_CONFIG_ID, Self::VERSION);
+        cosmic_config::ConfigSet::set(config, "monitors", &current.monitors)?;
+        #[cfg(unix)]
+        crate::tighten_config_dir_permissions(RENDERER_CONFIG_ID, Self::VERSION);
+        Ok(true)
+    }
+
+    /// The monitor keys that have a stored setting but aren't in `connected` —
+    /// the "disabled" monitors, sorted for stable display.
+    pub fn disconnected_monitors(&self, connected: &[ConnectedMonitor]) -> Vec<String> {
+        let mut keys: Vec<String> =
+            self.monitors.keys().filter(|key| !connected.iter().any(|m| &m.key == *key)).cloned().collect();
+        keys.sort();
+        keys
+    }
+}
+
+/// Resolve the assignment for `output`, which is the physical monitor `monitor` (its
+/// [`monitor_key`], when known). Order: the monitor's own entry (`pack: None` falls
+/// through to the default pack) > a legacy per-connector override > the default pack.
+pub fn resolve_monitor_assignment(output: &OutputId, monitor: Option<&str>, config: &RendererConfig) -> OutputAssignment {
+    if let Some(entry) = monitor.and_then(|key| config.monitors.get(key)) {
+        return match &entry.pack {
+            Some(source) => OutputAssignment::Explicit(source.clone()),
+            None if config.same_pack_everywhere.is_some() => OutputAssignment::FollowsToggle,
+            None => OutputAssignment::Unassigned,
+        };
+    }
+    resolve_assignment(output, config)
 }
 
 /// Resolve `output`'s [`OutputAssignment`] from the current [`RendererConfig`]
@@ -327,6 +475,99 @@ mod tests {
         let assignment = resolve_assignment(&OutputId::new("eDP-1"), &config);
         assert_eq!(assignment, OutputAssignment::Unassigned);
         assert_eq!(effective_pack(&assignment, &config), None);
+    }
+
+    fn connected(key: &str, connector: &str) -> ConnectedMonitor {
+        ConnectedMonitor { key: key.into(), connector: connector.into(), label: format!("Monitor {key}") }
+    }
+
+    #[test]
+    fn monitor_key_prefers_the_serial_and_ignores_the_port() {
+        let a = monitor_key("Dell Inc.", "U2720Q", Some("ABC123"), "DP-3");
+        assert_eq!(a, "edid-Dell_Inc_-U2720Q-ABC123");
+        assert_eq!(a, monitor_key("Dell Inc.", "U2720Q", Some("ABC123"), "HDMI-A-1"));
+        assert!(OutputId::validated(a).is_ok());
+    }
+
+    #[test]
+    fn monitor_key_without_a_usable_serial_uses_make_and_model_not_the_port() {
+        for serial in [None, Some("  "), Some("0000"), Some("Unknown"), Some("1111"), Some("16843009"), Some("7")] {
+            assert_eq!(monitor_key("BOE", "0x0BCA", serial, "eDP-1"), "model-BOE-0x0BCA");
+            assert_eq!(monitor_key("BOE", "0x0BCA", serial, "HDMI-A-1"), "model-BOE-0x0BCA");
+        }
+        assert!(OutputId::validated(monitor_key("Dell Inc.", "U2720Q", None, "DP-3")).is_ok());
+    }
+
+    #[test]
+    fn monitor_key_falls_back_to_the_output_name_without_any_edid_data() {
+        assert_eq!(monitor_key("", "", None, "Virtual-1"), "output-Virtual-1");
+        assert_eq!(monitor_key("Unknown", " ", Some("0"), "Virtual-1"), "output-Virtual-1");
+    }
+
+    #[test]
+    fn identical_serial_less_monitors_fall_back_to_their_output_names() {
+        let mut monitors = vec![
+            connected(&monitor_key("Dell", "P2419H", None, "DP-1"), "DP-1"),
+            connected(&monitor_key("Dell", "P2419H", None, "DP-2"), "DP-2"),
+            connected(&monitor_key("BOE", "0x0BCA", None, "eDP-1"), "eDP-1"),
+        ];
+        dedupe_monitor_keys(&mut monitors);
+        let keys: Vec<&str> = monitors.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, ["output-DP-1", "output-DP-2", "model-BOE-0x0BCA"]);
+    }
+
+    #[test]
+    fn identical_monitors_sharing_a_serial_fall_back_to_their_connectors() {
+        let mut monitors = vec![connected("edid-a-b-123", "DP-1"), connected("edid-a-b-123", "DP-2"), connected("edid-c", "DP-3")];
+        dedupe_monitor_keys(&mut monitors);
+        let keys: Vec<&str> = monitors.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, ["output-DP-1", "output-DP-2", "edid-c"]);
+    }
+
+    #[test]
+    fn a_monitor_entry_wins_over_a_legacy_override_and_none_means_default() {
+        let mut config = RendererConfig { same_pack_everywhere: Some(source("/default.jpg")), ..RendererConfig::default() };
+        config.overrides.insert("DP-3".into(), source("/legacy.jpg"));
+        let out = OutputId::new("DP-3");
+        assert_eq!(resolve_monitor_assignment(&out, Some("edid-x"), &config), OutputAssignment::Explicit(source("/legacy.jpg")));
+
+        config.monitors.insert("edid-x".into(), MonitorConfig { pack: Some(source("/mine.jpg")), ..MonitorConfig::default() });
+        assert_eq!(resolve_monitor_assignment(&out, Some("edid-x"), &config), OutputAssignment::Explicit(source("/mine.jpg")));
+
+        config.monitors.insert("edid-x".into(), MonitorConfig::default());
+        assert_eq!(resolve_monitor_assignment(&out, Some("edid-x"), &config), OutputAssignment::FollowsToggle);
+    }
+
+    #[test]
+    fn registering_inherits_the_legacy_override_and_survives_reconnects() {
+        let mut config = RendererConfig::default();
+        config.overrides.insert("DP-3".into(), source("/legacy.jpg"));
+        assert!(config.register_monitors(&[connected("edid-x", "DP-3")]));
+        assert_eq!(config.monitors["edid-x"].pack, Some(source("/legacy.jpg")));
+
+        config.monitors.get_mut("edid-x").unwrap().pack = Some(source("/chosen.jpg"));
+        // Unplugged: still known, reported as disconnected.
+        assert_eq!(config.disconnected_monitors(&[]), vec!["edid-x".to_string()]);
+        // Replugged into another port: same entry, pack kept, connector refreshed.
+        assert!(config.register_monitors(&[connected("edid-x", "HDMI-A-1")]));
+        assert_eq!(config.monitors["edid-x"].pack, Some(source("/chosen.jpg")));
+        assert_eq!(config.monitors["edid-x"].last_connector, "HDMI-A-1");
+        assert!(!config.register_monitors(&[connected("edid-x", "HDMI-A-1")]), "no-op when nothing changed");
+    }
+
+    #[test]
+    fn saving_registered_monitors_keeps_other_fields_written_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RendererConfig::open_at(dir.path()).unwrap();
+        let mut gui = RendererConfig::load(&config);
+        gui.crossfade_duration_secs = 7;
+        gui.save(&config).unwrap();
+
+        assert!(RendererConfig::save_registered_monitors(&config, &[connected("edid-x", "DP-3")]).unwrap());
+        let loaded = RendererConfig::load(&config);
+        assert_eq!(loaded.crossfade_duration_secs, 7);
+        assert!(loaded.monitors.contains_key("edid-x"));
+        assert!(!RendererConfig::save_registered_monitors(&config, &[connected("edid-x", "DP-3")]).unwrap());
     }
 
     #[test]

@@ -160,6 +160,15 @@ The settings application allows you to:
 
 A pack can contain the complete sequence of images needed to represent an entire day.
 
+The settings UI uses disk-cached previews (at most 192 x 192 pixels) in the pack
+list, editor, and timeline, rather than retaining full-resolution wallpaper
+textures for thumbnails. Previews are generated on first use and refreshed when
+the source file's size or modification time changes. The cache lives in
+`$XDG_CACHE_HOME/cosmic-dynamic-wallpaper/thumbnails-v1` (normally
+`~/.cache/cosmic-dynamic-wallpaper/thumbnails-v1`); it can be removed while the
+settings app is closed and will be regenerated. Original images are never resized
+or modified.
+
 ---
 
 ## Screenshots
@@ -296,8 +305,10 @@ cosmic-wallpaper-settings
 
 Use the settings application to:
 
-- Manage wallpaper packs
-- Assign wallpaper packs
+- Manage wallpaper packs — and build your own by dragging images into parts of the
+  day (night, dawn, sunrise, noon, sunset, dusk…); the app computes and shows each
+  image's time for your location
+- Choose a pack per monitor, plus a default pack for new monitors
 - Configure your location
 - Configure crossfade behavior
 - Configure scheduling
@@ -361,6 +372,15 @@ This is important for modern COSMIC Desktop installations where users may have c
 - 4K + 1080p displays
 - Mixed fractional scaling
 - Different monitor resolutions
+
+Each monitor can show its own pack (any pack can be used on several monitors). Monitors
+are recognized by their EDID data, so a monitor keeps its pack when it's plugged into
+a different port: by make, model and serial number, or by make and model when the
+monitor reports no usable serial. Only a display with no EDID data at all — or two
+identical serial-less monitors connected at once — falls back to its output name
+(`DP-1`). An unplugged monitor keeps its setting — the settings app lists it
+under "Disconnected monitors" until you choose "Forget". Monitors seen for the first
+time show the default pack.
 
 ---
 

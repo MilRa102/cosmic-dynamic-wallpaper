@@ -8,7 +8,10 @@
 //! output handle (`wl_output`) — that belongs to the Wayland integration (`surface.rs`)
 //! and is omitted here rather than faked.
 
-pub use wallpaper_ipc::{effective_pack, resolve_assignment, OutputAssignment, OutputId, RendererConfig, RENDERER_CONFIG_ID};
+pub use wallpaper_ipc::{
+    dedupe_monitor_keys, effective_pack, monitor_key, resolve_assignment, resolve_monitor_assignment, ConnectedMonitor, OutputAssignment, OutputId, RendererConfig,
+    RENDERER_CONFIG_ID,
+};
 
 use crate::crossfade::CrossfadeTransition;
 

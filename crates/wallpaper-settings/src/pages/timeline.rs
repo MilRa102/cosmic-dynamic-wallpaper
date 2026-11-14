@@ -19,8 +19,9 @@ use chrono::{DateTime, Local, TimeDelta};
 use cosmic::widget;
 use cosmic::Element;
 use schedule_engine::Location;
-use wallpaper_ipc::{effective_pack, resolve_assignment, DbusClient, DbusError, OutputId, QueryEntry, RendererConfig};
+use wallpaper_ipc::{effective_pack, resolve_monitor_assignment, ConnectedMonitor, DbusClient, DbusError, OutputId, QueryEntry, RendererConfig};
 
+use crate::i18n::tr;
 use crate::pack_display;
 
 /// T022: maps a `DbusClient` query outcome 1:1, including the "daemon unreachable"
@@ -61,6 +62,7 @@ pub struct TimelineRow {
 /// contract).
 pub fn rows_from_entries(
     entries: &[QueryEntry],
+    monitors: &[ConnectedMonitor],
     renderer_config: &RendererConfig,
     location: Option<&Location>,
     crossfade_duration: TimeDelta,
@@ -78,7 +80,8 @@ pub fn rows_from_entries(
                     next_update: None,
                 };
             }
-            let assignment = resolve_assignment(&OutputId::new(entry.output.clone()), renderer_config);
+            let monitor = monitors.iter().find(|m| m.connector == entry.output).map(|m| m.key.as_str());
+            let assignment = resolve_monitor_assignment(&OutputId::new(entry.output.clone()), monitor, renderer_config);
             let snapshot = effective_pack(&assignment, renderer_config)
                 .and_then(|source| pack_display::resolve_schedule_snapshot(source, location, crossfade_duration, at));
             match snapshot {
@@ -108,14 +111,20 @@ pub enum Message {
 
 pub struct State {
     pub timeline: TimelineState,
+    /// Connector → monitor identity, so the thumbnails follow the same per-monitor
+    /// assignment the daemon uses. Empty with an older daemon (connector fallback).
+    pub monitors: Vec<ConnectedMonitor>,
     pub renderer_config: RendererConfig,
     pub location: Option<Location>,
 }
 
 impl State {
     pub fn load(renderer_config: RendererConfig, location: Option<Location>) -> Self {
-        let result = DbusClient::connect().and_then(|client| client.query_all());
-        Self { timeline: from_query_result(result), renderer_config, location }
+        let (timeline, monitors) = match DbusClient::connect() {
+            Ok(client) => (from_query_result(client.query_all()), client.list_monitors().unwrap_or_default()),
+            Err(e) => (from_query_result(Err(e)), Vec::new()),
+        };
+        Self { timeline, monitors, renderer_config, location }
     }
 }
 
@@ -127,35 +136,35 @@ const UPDATE_COLUMN_WIDTH: u16 = 90;
 
 fn thumbnail_or_placeholder(path: &Option<PathBuf>) -> Element<'static, Message> {
     match path {
-        Some(p) => widget::image(p.clone()).width(THUMBNAIL_COLUMN_WIDTH).height(THUMBNAIL_COLUMN_WIDTH).into(),
-        None => widget::text::caption("(no preview)").into(),
+        Some(p) => crate::thumbnail::view(p, THUMBNAIL_COLUMN_WIDTH, THUMBNAIL_COLUMN_WIDTH),
+        None => widget::text::caption(tr("(no preview)")).into(),
     }
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
-    let mut section = widget::settings::section().title("Today's schedule");
+    let mut section = widget::settings::section().title(tr("Today's schedule"));
     match &state.timeline {
         TimelineState::Unreachable => {
-            section = section.add(widget::text::body("wallpaperd is not running or not reachable — start it to see live schedule data."));
+            section = section.add(widget::text::body(tr("wallpaperd is not running or not reachable — start it to see live schedule data.")));
         }
         TimelineState::Data(entries) if entries.is_empty() => {
-            section = section.add(widget::text::body("No outputs managed yet."));
+            section = section.add(widget::text::body(tr("No outputs managed yet.")));
         }
         TimelineState::Data(entries) => {
             let crossfade_duration = TimeDelta::seconds(i64::from(state.renderer_config.crossfade_duration_secs));
-            let rows = rows_from_entries(entries, &state.renderer_config, state.location.as_ref(), crossfade_duration, chrono::Local::now());
+            let rows = rows_from_entries(entries, &state.monitors, &state.renderer_config, state.location.as_ref(), crossfade_duration, chrono::Local::now());
 
             let header = widget::row::with_capacity(4)
                 .spacing(cosmic::theme::spacing().space_m)
-                .push(widget::text::caption_heading("Output").width(OUTPUT_COLUMN_WIDTH))
-                .push(widget::text::caption_heading("Current").width(THUMBNAIL_COLUMN_WIDTH))
-                .push(widget::text::caption_heading("Next").width(THUMBNAIL_COLUMN_WIDTH))
-                .push(widget::text::caption_heading("Updates at").width(UPDATE_COLUMN_WIDTH));
+                .push(widget::text::caption_heading(tr("Output")).width(OUTPUT_COLUMN_WIDTH))
+                .push(widget::text::caption_heading(tr("Current")).width(THUMBNAIL_COLUMN_WIDTH))
+                .push(widget::text::caption_heading(tr("Next")).width(THUMBNAIL_COLUMN_WIDTH))
+                .push(widget::text::caption_heading(tr("Updates at")).width(UPDATE_COLUMN_WIDTH));
             section = section.add(header);
 
             for row in &rows {
                 let update_text = if !row.assigned {
-                    "unassigned".to_string()
+                    tr("unassigned")
                 } else {
                     row.next_update.clone().unwrap_or_else(|| "—".to_string())
                 };
@@ -170,7 +179,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
             }
         }
     }
-    let refresh = widget::button::standard("Refresh").on_press(Message::Refresh);
+    let refresh = widget::button::standard(tr("Refresh")).on_press(Message::Refresh);
     widget::scrollable(widget::column::with_capacity(2).push(refresh).push(section)).into()
 }
 
@@ -225,7 +234,7 @@ mod tests {
     fn unassigned_entries_map_to_a_row_with_no_thumbnails_or_update_time() {
         let entries = vec![entry("DP-3", false)];
         let config = RendererConfig::default();
-        let rows = rows_from_entries(&entries, &config, None, TimeDelta::minutes(1), local_at(12, 0));
+        let rows = rows_from_entries(&entries, &[], &config, None, TimeDelta::minutes(1), local_at(12, 0));
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].assigned);
@@ -241,7 +250,7 @@ mod tests {
     fn assigned_entry_with_no_resolvable_pack_source_has_no_thumbnails() {
         let entries = vec![entry("DP-3", true)];
         let config = RendererConfig::default(); // no toggle, no overrides
-        let rows = rows_from_entries(&entries, &config, None, TimeDelta::minutes(1), local_at(12, 0));
+        let rows = rows_from_entries(&entries, &[], &config, None, TimeDelta::minutes(1), local_at(12, 0));
 
         assert!(rows[0].assigned);
         assert_eq!(rows[0].current_thumbnail, None);
@@ -272,7 +281,7 @@ mod tests {
         let config = RendererConfig { same_pack_everywhere: Some(source), ..RendererConfig::default() };
         let entries = vec![entry("DP-3", true)];
 
-        let rows = rows_from_entries(&entries, &config, None, TimeDelta::minutes(1), local_at(12, 0));
+        let rows = rows_from_entries(&entries, &[], &config, None, TimeDelta::minutes(1), local_at(12, 0));
 
         assert_eq!(rows[0].current_thumbnail.as_ref().and_then(|p| p.file_name()), Some(std::ffi::OsStr::new("dawn.png")));
         assert_eq!(rows[0].next_thumbnail.as_ref().and_then(|p| p.file_name()), Some(std::ffi::OsStr::new("dusk.png")));
@@ -322,7 +331,7 @@ mod tests {
         config.overrides.insert("DP-3".to_string(), override_source);
         let entries = vec![entry("DP-3", true)];
 
-        let rows = rows_from_entries(&entries, &config, None, TimeDelta::minutes(1), local_at(12, 0));
+        let rows = rows_from_entries(&entries, &[], &config, None, TimeDelta::minutes(1), local_at(12, 0));
 
         assert_eq!(rows[0].current_thumbnail.as_ref().and_then(|p| p.file_name()), Some(std::ffi::OsStr::new("c.png")));
     }

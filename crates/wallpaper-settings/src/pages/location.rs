@@ -10,6 +10,8 @@ use cosmic::Element;
 use schedule_engine::Location;
 use wallpaper_ipc::{effective_location, LocationConfigEntry, LocationMode, ResolutionStatus, IP_GEOLOCATION_DISCLOSURE};
 
+use crate::i18n::{tr, trf};
+
 /// T021: writes the identical `mode` shape `wallpaperctl location auto|manual|ip`
 /// writes, for all three modes — pure, independent of any config I/O.
 pub fn set_mode(entry: &mut LocationConfigEntry, mode: LocationMode) {
@@ -51,19 +53,19 @@ impl State {
     }
 }
 
-fn mode_label(mode: LocationMode) -> &'static str {
-    match mode {
+fn mode_label(mode: LocationMode) -> String {
+    tr(match mode {
         LocationMode::IpGeolocation => "IP-geolocation",
         LocationMode::Automatic => "Automatic (portal)",
         LocationMode::Manual => "Manual",
-    }
+    })
 }
 
 fn status_label(status: &ResolutionStatus) -> String {
     match status {
-        ResolutionStatus::Unresolved => "unresolved".to_string(),
-        ResolutionStatus::Resolved => "resolved".to_string(),
-        ResolutionStatus::Unavailable { reason } => format!("unavailable ({reason})"),
+        ResolutionStatus::Unresolved => tr("unresolved"),
+        ResolutionStatus::Resolved => tr("resolved"),
+        ResolutionStatus::Unavailable { reason } => trf("unavailable ({reason})", &[("reason", reason)]),
     }
 }
 
@@ -107,13 +109,13 @@ fn simplify_portal_reason(reason: &str) -> &'static str {
 /// doesn't apply there.
 fn portal_status_label(status: &ResolutionStatus) -> String {
     match status {
-        ResolutionStatus::Unavailable { reason } => simplify_portal_reason(reason).to_string(),
+        ResolutionStatus::Unavailable { reason } => tr(simplify_portal_reason(reason)),
         _ => status_label(status),
     }
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
-    let mut mode_section = widget::settings::section().title("Location mode");
+    let mut mode_section = widget::settings::section().title(tr("Location mode"));
     for mode in [LocationMode::IpGeolocation, LocationMode::Automatic, LocationMode::Manual] {
         let radio = widget::radio("", mode, Some(state.entry.mode), Message::SelectMode);
         if mode == LocationMode::IpGeolocation {
@@ -126,33 +128,33 @@ pub fn view(state: &State) -> Element<'_, Message> {
                 .push(radio);
             mode_section = mode_section.add(widget::settings::item(mode_label(mode), row));
             if state.show_ip_disclosure {
-                mode_section = mode_section.add(widget::text::caption(IP_GEOLOCATION_DISCLOSURE));
+                mode_section = mode_section.add(widget::text::caption(tr(IP_GEOLOCATION_DISCLOSURE)));
             }
         } else {
             mode_section = mode_section.add(widget::settings::item(mode_label(mode), radio));
         }
     }
 
-    let mut status_section = widget::settings::section().title("Current status");
+    let mut status_section = widget::settings::section().title(tr("Current status"));
     let effective = effective_location(&state.entry);
     status_section = status_section.add(widget::settings::item(
-        "Effective location",
-        widget::text::body(effective.map(|l| format!("{} {}", l.latitude(), l.longitude())).unwrap_or_else(|| "none".to_string())),
+        tr("Effective location"),
+        widget::text::body(effective.map(|l| format!("{} {}", l.latitude(), l.longitude())).unwrap_or_else(|| tr("none"))),
     ));
-    status_section = status_section.add(widget::settings::item("Portal status", widget::text::body(portal_status_label(&state.entry.automatic_status))));
-    status_section = status_section.add(widget::settings::item("IP-geolocation status", widget::text::body(status_label(&state.entry.ip_status))));
+    status_section = status_section.add(widget::settings::item(tr("Portal status"), widget::text::body(portal_status_label(&state.entry.automatic_status))));
+    status_section = status_section.add(widget::settings::item(tr("IP-geolocation status"), widget::text::body(status_label(&state.entry.ip_status))));
 
     let manual_section = widget::settings::section()
-        .title("Manual location")
+        .title(tr("Manual location"))
         .add(widget::settings::item(
-            "Latitude",
-            widget::text_input::text_input("latitude", &state.latitude_input).on_input(Message::LatitudeChanged),
+            tr("Latitude"),
+            widget::text_input::text_input(tr("latitude"), &state.latitude_input).on_input(Message::LatitudeChanged),
         ))
         .add(widget::settings::item(
-            "Longitude",
-            widget::text_input::text_input("longitude", &state.longitude_input).on_input(Message::LongitudeChanged),
+            tr("Longitude"),
+            widget::text_input::text_input(tr("longitude"), &state.longitude_input).on_input(Message::LongitudeChanged),
         ))
-        .add(widget::button::suggested("Set manual location").on_press(Message::SetManualLocation));
+        .add(widget::button::suggested(tr("Set manual location")).on_press(Message::SetManualLocation));
 
     widget::scrollable(
         widget::column::with_capacity(3)

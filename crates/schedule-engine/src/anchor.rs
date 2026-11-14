@@ -2,6 +2,8 @@
 
 use chrono::{NaiveTime, TimeDelta};
 
+use crate::periods::SolarPeriod;
+
 /// The eight solar events FR-6 recognizes.
 ///
 /// `SolarNoon` and `SolarMidnight` are not directly exposed by the underlying `sunrise`
@@ -43,6 +45,16 @@ pub enum TimeAnchor {
     },
     /// Anchored to an absolute wall-clock time of day (FR-11).
     Clock(NaiveTime),
+    /// Placed in a solar block: slot `slot` of `of` evenly spaced slots inside `period`
+    /// (see [`crate::PeriodLayout`]).
+    Period {
+        /// Which block.
+        period: SolarPeriod,
+        /// Zero-based position within the block.
+        slot: u8,
+        /// How many images share the block.
+        of: u8,
+    },
 }
 
 impl TimeAnchor {
@@ -64,5 +76,19 @@ impl TimeAnchor {
     /// `true` if this is a [`TimeAnchor::Clock`] anchor.
     pub fn is_clock(&self) -> bool {
         matches!(self, TimeAnchor::Clock(_))
+    }
+
+    /// `true` if this is a [`TimeAnchor::Period`] anchor.
+    pub fn is_period(&self) -> bool {
+        matches!(self, TimeAnchor::Period { .. })
+    }
+
+    /// Which [`crate::AnchorKind`] this anchor belongs to.
+    pub fn kind(&self) -> crate::AnchorKind {
+        match self {
+            TimeAnchor::Solar { .. } => crate::AnchorKind::Solar,
+            TimeAnchor::Clock(_) => crate::AnchorKind::Clock,
+            TimeAnchor::Period { .. } => crate::AnchorKind::Period,
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! `wallpaperctl assign --output <id> <pack>` / `assign --same-everywhere <pack>`
-//! (FR-006, FR-007).
+//! (FR-006, FR-007). `<id>` is either a monitor key (`edid-…`/`model-…`/`output-…`, see
+//! `wallpaper_ipc::monitor_key`) or a connector name (`DP-3`).
 
 use std::path::Path;
 
@@ -32,10 +33,11 @@ pub fn run(
     let source = find_registered(registry, pack_path)
         .ok_or_else(|| CliError::PackNotFound { source: pack_path.to_path_buf() })?;
 
+    let connected = DbusClient::connect().and_then(|client| client.list_monitors()).ok();
     let mut state = RendererConfig::load(renderer_config);
     let target_desc = match &target {
         AssignTarget::Output(id) => {
-            state.overrides.insert(id.clone(), source.clone());
+            assign_output(&mut state, id, &source, connected.as_deref());
             format!("output {id:?}")
         }
         AssignTarget::SameEverywhere => {
@@ -51,7 +53,7 @@ pub fn run(
     if let AssignTarget::Output(id) = &target {
         if let Ok(client) = DbusClient::connect() {
             if let Ok(entries) = client.query_all() {
-                if !entries.iter().any(|e| &e.output == id) {
+                if !entries.iter().any(|e| &e.output == id) && !connected.iter().flatten().any(|m| &m.key == id) {
                     eprintln!(
                         "warning: output {id:?} is not currently connected — the assignment is saved and will apply once it connects"
                     );
@@ -61,6 +63,28 @@ pub fn run(
     }
 
     Ok(output::render(json, &Ack::ok(), || format!("assigned to {target_desc}")))
+}
+
+/// `id` naming a known monitor key sets that monitor's pack. A connector name writes
+/// the legacy per-connector override (applies to monitors seen there for the first
+/// time) and also updates the monitor on that connector — the connected one when the
+/// daemon tells us, else every stored monitor last seen there — since a stored
+/// monitor entry takes precedence over the override.
+fn assign_output(state: &mut RendererConfig, id: &str, source: &pack_loader::PackSource, connected: Option<&[wallpaper_ipc::ConnectedMonitor]>) {
+    if let Some(monitor) = state.monitors.get_mut(id) {
+        monitor.pack = Some(source.clone());
+        return;
+    }
+    state.overrides.insert(id.to_string(), source.clone());
+    for (key, monitor) in &mut state.monitors {
+        let on_connector = match connected {
+            Some(connected) => connected.iter().any(|m| &m.key == key && m.connector == id),
+            None => monitor.last_connector == id,
+        };
+        if on_connector {
+            monitor.pack = Some(source.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +188,23 @@ mod tests {
         );
         assert!(matches!(result, Err(CliError::PackNotFound { .. })));
         assert!(RendererConfig::load(&renderer_config).overrides.is_empty());
+    }
+
+    #[test]
+    fn connector_assignment_also_updates_the_registered_monitor_on_it() {
+        let a = pack_loader::PackSource::StaticFile("/a.jpg".into());
+        let mut state = RendererConfig::default();
+        state.monitors.insert(
+            "edid-x".into(),
+            wallpaper_ipc::MonitorConfig { pack: None, label: String::new(), last_connector: "DP-3".into() },
+        );
+        assign_output(&mut state, "DP-3", &a, None);
+        assert_eq!(state.monitors["edid-x"].pack, Some(a.clone()));
+        assert_eq!(state.overrides.get("DP-3"), Some(&a));
+
+        let b = pack_loader::PackSource::StaticFile("/b.jpg".into());
+        assign_output(&mut state, "edid-x", &b, None);
+        assert_eq!(state.monitors["edid-x"].pack, Some(b));
+        assert!(!state.overrides.contains_key("edid-x"));
     }
 }

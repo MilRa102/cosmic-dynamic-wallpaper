@@ -6,16 +6,24 @@
 //! is reused verbatim from that crate, but its compact on-disk string grammar is this
 //! crate's own concern, since `TimeAnchor` has no `Deserialize` impl of its own (it's a
 //! pure-logic type with no I/O).
+//!
+//! Schema version 2 adds the `period = "<block>"` image field as the alternative to
+//! `anchor`: the image is placed into a solar block ([`schedule_engine::SolarPeriod`])
+//! and its time is derived from its position among the block's images, in manifest
+//! order. Version 1 manifests keep loading unchanged.
 
 use serde::{Deserialize, Serialize};
 
 use chrono::{NaiveTime, TimeDelta};
-use schedule_engine::{SolarEventKind, TimeAnchor};
+use schedule_engine::{SolarEventKind, SolarPeriod, TimeAnchor};
 
 use crate::error::ManifestError;
 
 /// The highest `schema_version` this loader understands.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+
+/// The first schema version that accepts the `period` image field.
+pub const PERIOD_SCHEMA_VERSION: u32 = 2;
 
 /// Scaling/fit mode — matches `cosmic-bg`'s existing vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +190,10 @@ struct RawManifest {
 #[derive(Debug, Deserialize)]
 struct RawManifestImage {
     file: String,
-    anchor: String,
+    #[serde(default)]
+    anchor: Option<String>,
+    #[serde(default)]
+    period: Option<String>,
     #[serde(default)]
     scaling: Option<String>,
 }
@@ -199,23 +210,36 @@ pub fn parse(text: &str, path: &std::path::Path) -> Result<PackManifest, Manifes
             max_supported: MAX_SUPPORTED_SCHEMA_VERSION,
         });
     }
-    // No older schema version exists yet to migrate from (this is version 1) — the
-    // migration `match` has a single documented arm today and grows as new versions
-    // are introduced.
+    // Version 2 only adds the optional `period` field; a version-1 manifest is a valid
+    // version-2 manifest that doesn't use it, so no migration step is needed.
 
     let default_scaling = ScalingMode::parse(&raw.default_scaling)?;
     let fallback_color = Color::parse(&raw.fallback_color)?;
 
-    let images = raw
+    let schema_version = raw.schema_version;
+    let mut ranks = Vec::with_capacity(raw.images.len());
+    let mut images = raw
         .images
         .into_iter()
         .map(|img| {
-            let anchor = parse_anchor(&img.anchor)
-                .map_err(|_| ManifestError::InvalidAnchor { file: img.file.clone(), value: img.anchor.clone() })?;
+            let invalid = |value: &str| ManifestError::InvalidAnchor { file: img.file.clone(), value: value.to_string() };
+            let anchor = match (&img.anchor, &img.period) {
+                (Some(anchor), None) => parse_anchor(anchor).map_err(|_| invalid(anchor))?,
+                (None, Some(period)) if schema_version >= PERIOD_SCHEMA_VERSION => {
+                    let (period, rank) = SolarPeriod::parse_with_rank(period).ok_or_else(|| invalid(period))?;
+                    ranks.push(rank);
+                    // Slots are filled in below once every image of the block is known.
+                    TimeAnchor::Period { period, slot: 0, of: 0 }
+                }
+                (None, Some(period)) => return Err(invalid(&format!("period = {period:?} needs schema_version = 2"))),
+                (Some(_), Some(_)) => return Err(invalid("both `anchor` and `period` are set")),
+                (None, None) => return Err(invalid("neither `anchor` nor `period` is set")),
+            };
             let scaling = img.scaling.as_deref().map(ScalingMode::parse).transpose()?;
             Ok(ManifestImage { file: img.file, anchor, scaling })
         })
         .collect::<Result<Vec<_>, ManifestError>>()?;
+    assign_period_slots(&mut images, &ranks);
 
     Ok(PackManifest {
         schema_version: raw.schema_version,
@@ -225,6 +249,31 @@ pub fn parse(text: &str, path: &std::path::Path) -> Result<PackManifest, Manifes
         fallback_color,
         images,
     })
+}
+
+/// Number each period-placed image within its block: by `ranks` (one per period image,
+/// in manifest order — see [`SolarPeriod::parse_with_rank`]; it orders legacy blocks
+/// folded into the same part of the day), then by manifest order. Blocks with more than
+/// 255 images saturate; the engine's 64-image cap rejects those packs anyway.
+fn assign_period_slots(images: &mut [ManifestImage], ranks: &[u8]) {
+    let mut members: [Vec<(u8, usize)>; SolarPeriod::COUNT] = Default::default();
+    let period_images = images.iter().enumerate().filter_map(|(i, img)| match img.anchor {
+        TimeAnchor::Period { period, .. } => Some((i, period)),
+        _ => None,
+    });
+    for ((i, period), &rank) in period_images.zip(ranks) {
+        members[period.index()].push((rank, i));
+    }
+    for mut block in members {
+        block.sort_by_key(|&(rank, _)| rank);
+        let of = u8::try_from(block.len()).unwrap_or(u8::MAX);
+        for (slot, (_, i)) in block.into_iter().enumerate() {
+            if let TimeAnchor::Period { slot: s, of: o, .. } = &mut images[i].anchor {
+                *s = u8::try_from(slot).unwrap_or(u8::MAX);
+                *o = of;
+            }
+        }
+    }
 }
 
 /// Parse a compact anchor string into the scheduling engine's [`TimeAnchor`].
@@ -291,29 +340,45 @@ struct RawManifestOut {
 #[derive(Debug, Serialize)]
 struct RawManifestImageOut {
     file: String,
-    anchor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    period: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scaling: Option<String>,
 }
 
 /// Render a [`ManifestDraft`] into `manifest.toml` text — the write-side counterpart
-/// to [`parse`]. Always writes `schema_version = 1`. Every string value is routed
+/// to [`parse`]. Writes `schema_version = 1` unless an image is placed into a solar
+/// block, which needs version 2; period images are emitted grouped by block in slot
+/// order so [`parse`] reassigns the same slots. Every string value is routed
 /// through `toml`'s own `Serialize` machinery rather than hand-built interpolation, so
 /// a `name`/`author`/`file` containing a `"` or non-ASCII text round-trips correctly
 /// instead of producing broken TOML.
 pub fn render(draft: &ManifestDraft) -> String {
+    let mut images: Vec<&ManifestDraftImage> = draft.images.iter().collect();
+    let uses_periods = images.iter().any(|img| img.anchor.is_period());
+    if uses_periods {
+        images.sort_by_key(|img| match img.anchor {
+            TimeAnchor::Period { period, slot, .. } => (period.index(), slot),
+            _ => (usize::MAX, u8::MAX),
+        });
+    }
     let raw = RawManifestOut {
-        schema_version: 1,
+        schema_version: if uses_periods { PERIOD_SCHEMA_VERSION } else { 1 },
         name: draft.name.clone(),
         author: draft.author.clone(),
         default_scaling: format_scaling(draft.default_scaling).to_string(),
         fallback_color: format_color(draft.fallback_color),
-        images: draft
-            .images
-            .iter()
+        images: images
+            .into_iter()
             .map(|img| RawManifestImageOut {
                 file: img.file.clone(),
-                anchor: format_anchor(&img.anchor),
+                anchor: (!img.anchor.is_period()).then(|| format_anchor(&img.anchor)),
+                period: match img.anchor {
+                    TimeAnchor::Period { period, .. } => Some(period.as_str().to_string()),
+                    _ => None,
+                },
                 scaling: img.scaling.map(|s| format_scaling(s).to_string()),
             })
             .collect(),
@@ -353,9 +418,12 @@ fn format_color(color: Color) -> String {
 /// when an offset is set. Round-trip contract, asserted directly by this module's own
 /// unit tests: `parse_anchor(&format_anchor(&a)) == Ok(a)` for every `a` this crate's
 /// callers can construct (whole-minute clock times, offsets with no sub-second part).
+/// [`TimeAnchor::Period`] isn't an `anchor` string at all; it formats as its block name
+/// (the `period` field's value) for display.
 pub fn format_anchor(anchor: &TimeAnchor) -> String {
     match anchor {
         TimeAnchor::Clock(time) => time.format("%H:%M").to_string(),
+        TimeAnchor::Period { period, .. } => period.as_str().to_string(),
         TimeAnchor::Solar { event, offset } => {
             let event_str = format_solar_event(*event);
             match offset {
@@ -665,5 +733,107 @@ fallback_color = "#000000"
 
         assert_eq!(parsed.images[0].scaling, Some(ScalingMode::Center));
         assert_eq!(parsed.images[1].scaling, None, "an image with no override must parse back to None, not Fill");
+    }
+
+    fn period_manifest(schema_version: u32) -> String {
+        format!(
+            r##"schema_version = {schema_version}
+name = "Blocks"
+default_scaling = "Fill"
+fallback_color = "#000000"
+
+[[images]]
+file = "m1.jpg"
+period = "morning"
+
+[[images]]
+file = "n.jpg"
+period = "night"
+
+[[images]]
+file = "m2.jpg"
+period = "morning"
+"##
+        )
+    }
+
+    #[test]
+    fn parses_period_images_with_slots_in_manifest_order() {
+        let parsed = parse(&period_manifest(2), std::path::Path::new("m.toml")).unwrap();
+        let anchors: Vec<_> = parsed.images.iter().map(|i| i.anchor).collect();
+        assert_eq!(
+            anchors,
+            vec![
+                TimeAnchor::Period { period: SolarPeriod::Morning, slot: 0, of: 2 },
+                TimeAnchor::Period { period: SolarPeriod::Night, slot: 0, of: 1 },
+                TimeAnchor::Period { period: SolarPeriod::Morning, slot: 1, of: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_block_names_merge_into_parts_of_the_day_in_chronological_order() {
+        // Written by the 12-block editor: grouped by the old block order, pre-dawn
+        // `night` first — but Night now starts at dusk.
+        let manifest = period_manifest(2)
+            .replace("file = \"m1.jpg\"\nperiod = \"morning\"", "file = \"predawn.jpg\"\nperiod = \"night\"")
+            .replace("file = \"n.jpg\"\nperiod = \"night\"", "file = \"rise.jpg\"\nperiod = \"sunrise\"")
+            .replace("file = \"m2.jpg\"\nperiod = \"morning\"", "file = \"dusk.jpg\"\nperiod = \"astronomical_dusk\"");
+        let parsed = parse(&manifest, std::path::Path::new("m.toml")).unwrap();
+        let anchors: Vec<_> = parsed.images.iter().map(|i| (i.file.as_str(), i.anchor)).collect();
+        assert_eq!(
+            anchors,
+            vec![
+                ("predawn.jpg", TimeAnchor::Period { period: SolarPeriod::Night, slot: 1, of: 2 }),
+                ("rise.jpg", TimeAnchor::Period { period: SolarPeriod::Morning, slot: 0, of: 1 }),
+                ("dusk.jpg", TimeAnchor::Period { period: SolarPeriod::Night, slot: 0, of: 2 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn period_field_requires_schema_v2_and_excludes_anchor() {
+        assert!(matches!(
+            parse(&period_manifest(1), std::path::Path::new("m.toml")),
+            Err(ManifestError::InvalidAnchor { .. })
+        ));
+        let both = period_manifest(2).replace("period = \"night\"", "period = \"night\"\nanchor = \"sunrise\"");
+        assert!(matches!(parse(&both, std::path::Path::new("m.toml")), Err(ManifestError::InvalidAnchor { .. })));
+        let unknown = period_manifest(2).replace("\"night\"", "\"moonlight\"");
+        assert!(matches!(parse(&unknown, std::path::Path::new("m.toml")), Err(ManifestError::InvalidAnchor { .. })));
+    }
+
+    #[test]
+    fn render_round_trips_period_drafts_as_schema_v2() {
+        let image = |file: &str, period, slot, of| ManifestDraftImage {
+            file: file.into(),
+            anchor: TimeAnchor::Period { period, slot, of },
+            scaling: None,
+        };
+        let draft = ManifestDraft {
+            name: "Blocks".into(),
+            author: None,
+            default_scaling: ScalingMode::Fill,
+            fallback_color: draft_color(),
+            // Deliberately out of order: render groups by block and slot.
+            images: vec![
+                image("m2.jpg", SolarPeriod::Morning, 1, 2),
+                image("n.jpg", SolarPeriod::Night, 0, 1),
+                image("m1.jpg", SolarPeriod::Morning, 0, 2),
+            ],
+        };
+        let text = render(&draft);
+        assert!(!text.contains("anchor"));
+        let parsed = parse(&text, std::path::Path::new("m.toml")).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        let got: Vec<_> = parsed.images.iter().map(|i| (i.file.as_str(), i.anchor)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("m1.jpg", TimeAnchor::Period { period: SolarPeriod::Morning, slot: 0, of: 2 }),
+                ("m2.jpg", TimeAnchor::Period { period: SolarPeriod::Morning, slot: 1, of: 2 }),
+                ("n.jpg", TimeAnchor::Period { period: SolarPeriod::Night, slot: 0, of: 1 }),
+            ]
+        );
     }
 }
